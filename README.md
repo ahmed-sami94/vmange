@@ -1,4 +1,5 @@
 # VMange
+<img width="1004" height="666" alt="vboxmange" src="https://github.com/user-attachments/assets/3b20de8e-457a-4ba8-8115-51ef85409859" />
 
 VMange is a free and open-source infrastructure management dashboard for Linux hosts, VirtualBox, Docker, Docker Compose, scripts, terminal workflows, monitoring, and alarms.
 
