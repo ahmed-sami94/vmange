@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-AGENT_VERSION="v1.7.0"
+AGENT_VERSION="v2.0.0"
 
 if [ -z "${VMANGE_API_URL:-}" ] && [ -r /etc/vmange/agent.env ]; then
   set -a
@@ -10,8 +10,15 @@ if [ -z "${VMANGE_API_URL:-}" ] && [ -r /etc/vmange/agent.env ]; then
 fi
 
 API_URL="${VMANGE_API_URL:-}"
-TOKEN="${VMANGE_TOKEN:-change-me-agent-token}"
+TOKEN="${VMANGE_TOKEN:-}"
 HOSTNAME_VALUE="${VMANGE_HOSTNAME:-$(hostname)}"
+HOST_UUID="${VMANGE_HOST_UUID:-}"
+if [ -z "$HOST_UUID" ] && [ -r /etc/machine-id ]; then
+  HOST_UUID=$(head -n 1 /etc/machine-id | tr -cd 'a-fA-F0-9-')
+fi
+if [ -z "$HOST_UUID" ]; then
+  HOST_UUID=$(printf '%s' "$HOSTNAME_VALUE" | sha256sum 2>/dev/null | cut -c1-32 || printf '%s' "$HOSTNAME_VALUE" | cksum | awk '{print $1}')
+fi
 INTERVAL="${VMANGE_INTERVAL:-15}"
 COMPOSE_ROOT="${VMANGE_COMPOSE_ROOT:-/var/lib/vmange/compose}"
 RUN_USER="${VMANGE_RUN_USER:-}"
@@ -64,6 +71,10 @@ json_payload_bool() {
   printf '%s' "$2" | sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\\(true\\|false\\).*/\\1/p" | head -n 1
 }
 
+normalize_text() {
+  printf '%s' "${1:-}" | tr -d '\r'
+}
+
 json_num() {
   local key="$1"
   printf '%s' "$2" | sed -n "s/.*\"$key\":\\([^,}]*\\).*/\\1/p" | head -n 1
@@ -88,10 +99,11 @@ run_as_vm_user() {
     return
   fi
   if command -v sudo >/dev/null 2>&1; then
-    sudo -u "$target_user" env HOME="${target_home:-/home/$target_user}" "$@"
+    sudo -n -u "$target_user" env HOME="${target_home:-/home/$target_user}" "$@"
     return
   fi
-  "$@"
+  echo "Cannot switch from $(id -un) to configured VM user $target_user: runuser or passwordless sudo is required." >&2
+  return 126
 }
 
 collect_vms() {
@@ -141,10 +153,106 @@ command_target_name() {
   printf '%s' "$target"
 }
 
+vm_state() {
+  local vmname="$1"
+  run_as_vm_user "$VBOXMANAGE_BIN" showvminfo "$vmname" --machinereadable 2>/dev/null \
+    | awk -F= '/^VMState=/{gsub(/"/,"",$2); print tolower($2); exit}'
+}
+
+vm_state_matches() {
+  local current="$1"
+  local expected="$2"
+  case "$expected" in
+    running) [ "$current" = "running" ] ;;
+    paused) [ "$current" = "paused" ] ;;
+    stopped) [ "$current" = "poweroff" ] || [ "$current" = "saved" ] || [ "$current" = "aborted" ] ;;
+    *) [ "$current" = "$expected" ] ;;
+  esac
+}
+
+wait_for_vm_state() {
+  local vmname="$1"
+  local expected="$2"
+  local timeout_seconds="${3:-45}"
+  local elapsed=0 current=""
+  while [ "$elapsed" -lt "$timeout_seconds" ]; do
+    current=$(vm_state "$vmname" || true)
+    if vm_state_matches "$current" "$expected"; then
+      echo "VM state verified: $vmname is $current"
+      return 0
+    fi
+    sleep 2
+    elapsed=$((elapsed + 2))
+  done
+  current=$(vm_state "$vmname" || true)
+  echo "VM state verification timed out after ${timeout_seconds}s: expected $expected, current ${current:-unknown}" >&2
+  return 124
+}
+
+vm_preflight() {
+  local action="$1"
+  local vmname="$2"
+  local info current uuid
+  info=$(run_as_vm_user "$VBOXMANAGE_BIN" showvminfo "$vmname" --machinereadable 2>&1) || {
+    echo "VM preflight failed for '$vmname'." >&2
+    echo "$info" >&2
+    echo "Configured user=${RUN_USER:-$(id -un)} HOME=${HOME:-unset} VBoxManage=${VBOXMANAGE_BIN:-missing}" >&2
+    return 2
+  }
+  current=$(printf '%s\n' "$info" | awk -F= '/^VMState=/{gsub(/"/,"",$2); print tolower($2); exit}')
+  uuid=$(printf '%s\n' "$info" | awk -F= '/^UUID=/{gsub(/"/,"",$2); print $2; exit}')
+  echo "VM preflight: action=$action name=$vmname uuid=${uuid:-unknown} state=${current:-unknown} user=${RUN_USER:-$(id -un)} home=${HOME:-unset} vbox=$VBOXMANAGE_BIN"
+}
+
 vm_log_folder() {
   local vmname="$1"
   run_as_vm_user "$VBOXMANAGE_BIN" showvminfo "$vmname" --machinereadable 2>/dev/null \
     | awk -F= '/^LogFldr=/{gsub(/^"/,"",$2); gsub(/"$/,"",$2); print $2; exit}'
+}
+
+vm_recent_error_tail() {
+  local vmname="$1"
+  local logdir logfile matches
+  logdir=$(vm_log_folder "$vmname" || true)
+  if [ -z "$logdir" ] || [ ! -d "$logdir" ]; then
+    echo "VirtualBox log directory could not be resolved for $vmname." >&2
+    return 0
+  fi
+
+  echo "VirtualBox startup diagnostics from $logdir:" >&2
+  for logfile in "$logdir/VBox.log" "$logdir/VBox.log.1"; do
+    [ -f "$logfile" ] || continue
+    matches=$(grep -Eai 'VERR_|ERROR|Guru|fatal|NS_ERROR|terminated unexpectedly|SUPR3Hardened|VT-x|AMD-V|driver|kernel' "$logfile" 2>/dev/null | tail -n 80 || true)
+    echo "=== $(basename "$logfile") ===" >&2
+    if [ -n "$matches" ]; then
+      printf '%s\n' "$matches" >&2
+    else
+      tail -n 30 "$logfile" >&2 || true
+    fi
+  done
+}
+
+start_vm_headless() {
+  local vmname="$1"
+  local attempt output rc=1
+  for attempt in 1 2; do
+    if output=$(run_as_vm_user "$VBOXMANAGE_BIN" startvm "$vmname" --type headless 2>&1); then
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+    else
+      rc=$?
+      [ -n "$output" ] && printf '%s\n' "$output" >&2
+    fi
+
+    if [ "$attempt" -eq 1 ]; then
+      echo "VirtualBox start attempt 1 failed; retrying once in 2 seconds." >&2
+      sleep 2
+    fi
+  done
+
+  echo "VirtualBox start failed after 2 attempts." >&2
+  vm_recent_error_tail "$vmname"
+  return "$rc"
 }
 
 safe_log_file() {
@@ -425,8 +533,17 @@ collect_metrics() {
 }
 
 collect_capabilities() {
-  local has_virtualbox=false has_docker=false has_compose=false docker_bin="" compose_bin="" vbox_bin=""
-  [ -n "${VBOXMANAGE_BIN:-}" ] && has_virtualbox=true && vbox_bin="$VBOXMANAGE_BIN"
+  local has_virtualbox=false vbox_device_access=false has_docker=false has_compose=false has_root_helper=false docker_bin="" compose_bin="" vbox_bin=""
+  if [ -n "${VBOXMANAGE_BIN:-}" ]; then
+    vbox_bin="$VBOXMANAGE_BIN"
+    if run_as_vm_user "$VBOXMANAGE_BIN" --version >/dev/null 2>&1 \
+      && run_as_vm_user "$VBOXMANAGE_BIN" list vms >/dev/null 2>&1; then
+      has_virtualbox=true
+      if [ ! -e /dev/vboxdrv ] || [ -r /dev/vboxdrv -a -w /dev/vboxdrv ]; then
+        vbox_device_access=true
+      fi
+    fi
+  fi
   if command -v docker >/dev/null 2>&1; then
     docker_bin="$(command -v docker 2>/dev/null || printf docker)"
     if run_docker_cmd info >/dev/null 2>&1; then
@@ -437,8 +554,9 @@ collect_capabilities() {
       fi
     fi
   fi
-  printf '{"has_virtualbox":%s,"has_docker":%s,"has_compose":%s,"vboxmanage_bin":"%s","docker_bin":"%s","compose_bin":"%s","run_user":"%s","home":"%s","uptime_seconds":%d}\n' \
-    "$has_virtualbox" "$has_docker" "$has_compose" \
+  run_root_helper probe >/dev/null 2>&1 && has_root_helper=true
+  printf '{"has_virtualbox":%s,"vbox_device_access":%s,"has_docker":%s,"has_compose":%s,"has_root_helper":%s,"vboxmanage_bin":"%s","docker_bin":"%s","compose_bin":"%s","run_user":"%s","home":"%s","uptime_seconds":%d}\n' \
+    "$has_virtualbox" "$vbox_device_access" "$has_docker" "$has_compose" "$has_root_helper" \
     "$(printf '%s' "$vbox_bin" | json_escape)" "$(printf '%s' "$docker_bin" | json_escape)" "$(printf '%s' "$compose_bin" | json_escape)" \
     "$(printf '%s' "${RUN_USER:-$(id -un)}" | json_escape)" "$(printf '%s' "${HOME:-}" | json_escape)" \
     "$(awk '{print int($1)}' /proc/uptime 2>/dev/null || echo 0)"
@@ -448,6 +566,8 @@ collect_errors() {
   local errors=""
   if [ -z "${VBOXMANAGE_BIN:-}" ]; then
     errors="${errors}{\"collector\":\"virtualbox\",\"message\":\"VBoxManage was not found\"}"
+  elif [ -e /dev/vboxdrv ] && { [ ! -r /dev/vboxdrv ] || [ ! -w /dev/vboxdrv ]; }; then
+    errors="${errors}${errors:+,}{\"collector\":\"virtualbox\",\"message\":\"The agent user cannot access /dev/vboxdrv. Run Repair VirtualBox access after installing the latest maintenance helper.\"}"
   fi
   if command -v docker >/dev/null 2>&1 && ! run_docker_cmd info >/dev/null 2>&1; then
     errors="${errors}${errors:+,}{\"collector\":\"docker\",\"message\":\"Docker exists but the agent user cannot access the daemon\"}"
@@ -511,6 +631,7 @@ post_heartbeat() {
   local command_stdout="${5:-}"
   local command_stderr="${6:-}"
   local command_diagnostics="${7:-}"
+  local command_lease_token="${8:-}"
   local all_vms running_vms specs inventory metrics containers compose images capabilities collector_errors
   all_vms=$(collect_vms)
   running_vms=$(collect_running_vms)
@@ -540,10 +661,15 @@ post_heartbeat() {
   metric_kernel=$(json_str kernel "$metrics")
   metric_uptime=$(json_num uptime_seconds "$metrics")
 
+  local token_file curl_exit=0
+  token_file=$(mktemp)
+  chmod 0600 "$token_file"
+  printf '%s' "$TOKEN" > "$token_file"
   local args=(
-    -sS -X POST "$API_URL"
-    --data-urlencode "token=$TOKEN" \
+    -sS --proto '=https' --connect-timeout 15 --max-time 90 -X POST "$API_URL"
+    --data-urlencode "token@$token_file" \
     --data-urlencode "host=$HOSTNAME_VALUE" \
+    --data-urlencode "host_uuid=$HOST_UUID" \
     --data-urlencode "all_vms=$(printf '%s' "$all_vms" | b64)" \
     --data-urlencode "running_vms=$(printf '%s' "$running_vms" | b64)" \
     --data-urlencode "vm_specs=$(printf '%s' "$specs" | b64)" \
@@ -575,19 +701,59 @@ post_heartbeat() {
   [ -n "$command_stdout" ] && args+=(--data-urlencode "command_stdout=$(printf '%s' "$command_stdout" | b64)")
   [ -n "$command_stderr" ] && args+=(--data-urlencode "command_stderr=$(printf '%s' "$command_stderr" | b64)")
   [ -n "$command_diagnostics" ] && args+=(--data-urlencode "command_diagnostics_json=$(printf '%s' "$command_diagnostics" | b64)")
-  curl "${args[@]}" -w $'\nVMANGE_HTTP_CODE:%{http_code}'
+  [ -n "$command_lease_token" ] && args+=(--data-urlencode "command_lease_token=$command_lease_token")
+  curl "${args[@]}" -w $'\nVMANGE_HTTP_CODE:%{http_code}' || curl_exit=$?
+  rm -f "$token_file"
+  return "$curl_exit"
+}
+
+run_root_helper() {
+  if [ -S /run/vmange-maintenance.sock ] && command -v python3 >/dev/null 2>&1; then
+    python3 - "$@" <<'PYMAINT'
+import json, socket, sys
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(900)
+        sock.connect('/run/vmange-maintenance.sock')
+        sock.sendall((json.dumps(sys.argv[1:])+'\n').encode())
+        reply=b''
+        while not reply.endswith(b'\n') and len(reply)<262144:
+            part=sock.recv(8192)
+            if not part: break
+            reply+=part
+        result=json.loads(reply)
+        print(result.get('stdout',''),end='')
+        print(result.get('stderr',''),end='',file=sys.stderr)
+        sys.exit(int(result['exit_code']))
+except (OSError, ValueError, KeyError) as error:
+    print('Maintenance socket failed: '+str(error),file=sys.stderr)
+    sys.exit(1)
+PYMAINT
+    return $?
+  fi
+  [ -x /usr/local/sbin/vmange-root-helper ] || return 127
+  if [ "$(id -u)" -eq 0 ]; then
+    /usr/local/sbin/vmange-root-helper "$@"
+  else
+    echo 'Local maintenance socket is unavailable. Reinstall with the v2 host installer to provision it.' >&2
+    return 126
+  fi
 }
 
 agent_self_disable() {
   if [ "$(id -u)" -eq 0 ]; then
     systemctl disable --now vmange-agent.service 2>/dev/null || true
-    rm -f /etc/systemd/system/vmange-agent.service /usr/local/bin/vmange-agent /etc/vmange/agent.env 2>/dev/null || true
+    rm -f /etc/systemd/system/vmange-agent.service /usr/local/bin/vmange-agent /etc/vmange/agent.env "$AGENT_PATH" 2>/dev/null || true
     systemctl daemon-reload 2>/dev/null || true
+    return 0
+  fi
+  if run_root_helper probe >/dev/null 2>&1; then
+    run_root_helper uninstall-agent
     return 0
   fi
   if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
     sudo systemctl disable --now vmange-agent.service 2>/dev/null || true
-    sudo rm -f /etc/systemd/system/vmange-agent.service /usr/local/bin/vmange-agent /etc/vmange/agent.env 2>/dev/null || true
+    sudo rm -f /etc/systemd/system/vmange-agent.service /usr/local/bin/vmange-agent /etc/vmange/agent.env "$AGENT_PATH" 2>/dev/null || true
     sudo systemctl daemon-reload 2>/dev/null || true
     return 0
   fi
@@ -631,36 +797,76 @@ run_command() {
 
   case "$action" in
     agent_upgrade|agent_uninstall) ;;
-    container_start|container_stop|container_restart|container_pause|container_unpause|container_kill|container_remove|image_pull|image_remove|logs_tail|compose_up|compose_down|compose_pull|compose_restart|compose_deploy|dockerfile_deploy|host_install_virtualbox|host_install_docker|host_refresh_inventory|agent_restart|host_reboot|host_wol_send|script_run|terminal_exec) ;;
+    container_start|container_stop|container_restart|container_pause|container_unpause|container_kill|container_remove|image_pull|image_remove|logs_tail|compose_up|compose_down|compose_pull|compose_restart|compose_deploy|dockerfile_deploy|host_install_virtualbox|host_repair_virtualbox|host_install_docker|host_refresh_inventory|agent_restart|host_reboot|host_wol_send|script_run|terminal_exec) ;;
     *) [ -n "$VBOXMANAGE_BIN" ] || { echo "VBoxManage/vboxmanage command was not found"; return 2; } ;;
   esac
 
   case "$action" in
     start|stop|poweroff|pause|resume|reset|restart|refresh_inventory|snapshot_create|snapshot_restore|snapshot_delete|vm_clone|vm_delete|vm_set_resources|vm_set_boot_order|vm_set_description|vm_set_autostart|vm_attach_iso|vm_detach_iso|vm_attach_disk|vm_create_disk|vm_resize_disk|vm_set_network|vm_cable_connected|vm_export|vm_enable_vrde|vm_disable_vrde|vm_screenshot|vm_logs_list|vm_log_tail)
       target=$(command_target_name "$target" "$payload")
-      echo "vmange preflight: action=$action target=$target user=${RUN_USER:-$(id -un)} home=${HOME:-} vbox=${VBOXMANAGE_BIN:-missing}"
-      run_as_vm_user "$VBOXMANAGE_BIN" showvminfo "$target" --machinereadable >/dev/null 2>&1 || { echo "VM not found or inaccessible through VBoxManage: $target"; return 2; }
+      vm_preflight "$action" "$target" || return $?
       ;;
   esac
 
   case "$action" in
     start)
-      if collect_running_vms | grep -Fq "\"$target\""; then
+      value=$(vm_state "$target" || true)
+      if [ "$value" = "running" ]; then
         echo "VM is already running: $target"
+      elif [ "$value" = "paused" ]; then
+        run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" resume
+        wait_for_vm_state "$target" running 30
       else
-        run_as_vm_user "$VBOXMANAGE_BIN" startvm "$target" --type headless
+        start_vm_headless "$target"
+        wait_for_vm_state "$target" running 45
       fi
       ;;
-    stop) run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" acpipowerbutton ;;
-    poweroff) run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" poweroff ;;
-    pause) run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" pause ;;
-    resume) run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" resume ;;
-    reset) run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" reset ;;
+    stop)
+      value=$(vm_state "$target" || true)
+      if vm_state_matches "$value" stopped; then
+        echo "VM is already stopped: $target"
+      else
+        run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" acpipowerbutton
+        wait_for_vm_state "$target" stopped 90
+      fi
+      ;;
+    poweroff)
+      value=$(vm_state "$target" || true)
+      if vm_state_matches "$value" stopped; then
+        echo "VM is already stopped: $target"
+      else
+        run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" poweroff
+        wait_for_vm_state "$target" stopped 30
+      fi
+      ;;
+    pause)
+      value=$(vm_state "$target" || true)
+      if [ "$value" = "paused" ]; then
+        echo "VM is already paused: $target"
+      else
+        run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" pause
+        wait_for_vm_state "$target" paused 30
+      fi
+      ;;
+    resume)
+      value=$(vm_state "$target" || true)
+      if [ "$value" = "running" ]; then
+        echo "VM is already running: $target"
+      else
+        run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" resume
+        wait_for_vm_state "$target" running 30
+      fi
+      ;;
+    reset)
+      run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" reset
+      wait_for_vm_state "$target" running 30
+      ;;
     refresh_inventory) echo "inventory refresh requested" ;;
     restart)
       run_as_vm_user "$VBOXMANAGE_BIN" controlvm "$target" acpipowerbutton
-      sleep 8
-      run_as_vm_user "$VBOXMANAGE_BIN" startvm "$target" --type headless
+      wait_for_vm_state "$target" stopped 90
+      start_vm_headless "$target"
+      wait_for_vm_state "$target" running 45
       ;;
     snapshot_create)
       value=$(json_payload_str name "$payload")
@@ -840,7 +1046,7 @@ run_command() {
         fi
         echo "createvm: unattended media applied"
       fi
-      [ "$start_after" = "true" ] && run_as_vm_user "$VBOXMANAGE_BIN" startvm "$name" --type headless
+      [ "$start_after" = "true" ] && start_vm_headless "$name"
       [ "$start_after" = "true" ] && echo "createvm: vm boot started"
       ;;
     vm_enable_vrde)
@@ -919,6 +1125,7 @@ run_command() {
       install -d -m 0750 "$dir"
       value=$(json_payload_str compose_yaml "$payload")
       [ -n "$value" ] || value="$payload"
+      value=$(normalize_text "$value")
       printf '%s' "$value" > "$file"
       chmod 0640 "$file"
       run_docker_cmd compose -p "$project" -f "$file" config
@@ -933,6 +1140,7 @@ run_command() {
       install -d -m 0750 "$dir"
       value=$(json_payload_str dockerfile "$payload")
       [ -n "$value" ] || value="$payload"
+      value=$(normalize_text "$value")
       printf '%s' "$value" > "$file"
       chmod 0640 "$file"
       run_docker_cmd build --check -t "$image" "$dir" >/dev/null 2>&1 || true
@@ -943,11 +1151,15 @@ run_command() {
       ;;
     agent_restart)
       echo "agent restart requested"
-      ( sleep 2; as_root systemctl restart vmange-agent.service >/dev/null 2>&1 || true ) &
+      if ! run_root_helper restart-agent; then
+        ( sleep 2; as_root systemctl restart vmange-agent.service >/dev/null 2>&1 || true ) &
+      fi
       ;;
     host_reboot)
       echo "host reboot requested for $HOSTNAME_VALUE"
-      ( sleep 2; as_root systemctl reboot >/dev/null 2>&1 || as_root reboot >/dev/null 2>&1 || true ) &
+      if ! run_root_helper reboot-host; then
+        ( sleep 2; as_root systemctl reboot >/dev/null 2>&1 || as_root reboot >/dev/null 2>&1 || true ) &
+      fi
       ;;
     host_wol_send)
       local wol_mac wol_broadcast wol_port wol_target
@@ -985,54 +1197,126 @@ PY
       fi
       ;;
     host_install_docker)
-      as_root true >/dev/null
-      if command -v apt-get >/dev/null 2>&1; then
-        as_root apt-get update && as_root apt-get install -y docker.io docker-compose-plugin
-      elif command -v dnf >/dev/null 2>&1; then
-        as_root dnf install -y docker docker-compose-plugin
-      elif command -v yum >/dev/null 2>&1; then
-        as_root yum install -y docker docker-compose-plugin
+      if run_root_helper probe >/dev/null 2>&1; then
+        run_root_helper install-docker "${RUN_USER:-}"
       else
-        echo "No supported package manager found"; return 2
+        as_root true >/dev/null || return $?
+        if command -v apt-get >/dev/null 2>&1; then
+          as_root apt-get update
+          as_root apt-get install -y docker.io
+          as_root apt-get install -y docker-compose-plugin || as_root apt-get install -y docker-compose-v2 || as_root apt-get install -y docker-compose
+        elif command -v dnf >/dev/null 2>&1; then
+          as_root dnf install -y docker docker-compose-plugin
+        elif command -v yum >/dev/null 2>&1; then
+          as_root yum install -y docker docker-compose-plugin
+        else
+          echo "No supported package manager found"; return 2
+        fi
+        as_root systemctl enable --now docker 2>/dev/null || true
+        if [ -n "${RUN_USER:-}" ] && [ "$RUN_USER" != "root" ]; then
+          as_root usermod -aG docker "$RUN_USER" 2>/dev/null || true
+        fi
       fi
-      as_root systemctl enable --now docker 2>/dev/null || true
+      echo "Docker installation completed. The VMange agent will restart to refresh group membership."
+      if ! run_root_helper restart-agent; then
+        ( sleep 5; as_root systemctl restart vmange-agent.service >/dev/null 2>&1 || true ) &
+      fi
       ;;
     host_install_virtualbox)
-      as_root true >/dev/null
-      if command -v apt-get >/dev/null 2>&1; then
-        as_root apt-get update && as_root apt-get install -y virtualbox
-      elif command -v dnf >/dev/null 2>&1; then
-        as_root dnf install -y VirtualBox
-      elif command -v yum >/dev/null 2>&1; then
-        as_root yum install -y VirtualBox
+      if run_root_helper probe >/dev/null 2>&1; then
+        run_root_helper install-virtualbox "${RUN_USER:-}"
       else
-        echo "No supported package manager found"; return 2
+        as_root true >/dev/null || return $?
+        if command -v apt-get >/dev/null 2>&1; then
+          as_root apt-get update && as_root apt-get install -y virtualbox
+        elif command -v dnf >/dev/null 2>&1; then
+          as_root dnf install -y VirtualBox
+        elif command -v yum >/dev/null 2>&1; then
+          as_root yum install -y VirtualBox
+        else
+          echo "No supported package manager found"; return 2
+        fi
+        if [ -n "${RUN_USER:-}" ] && [ "$RUN_USER" != "root" ] && getent group vboxusers >/dev/null 2>&1; then
+          as_root usermod -aG vboxusers "$RUN_USER" 2>/dev/null || true
+        fi
       fi
+      VBOXMANAGE_BIN="$(command -v VBoxManage 2>/dev/null || command -v vboxmanage 2>/dev/null || true)"
+      [ -n "$VBOXMANAGE_BIN" ] || { echo "VirtualBox package completed but VBoxManage is still unavailable." >&2; return 2; }
+      echo "VirtualBox installation completed. The VMange agent will restart to refresh group membership."
+      if ! run_root_helper restart-agent; then
+        ( sleep 5; as_root systemctl restart vmange-agent.service >/dev/null 2>&1 || true ) &
+      fi
+      ;;
+    host_repair_virtualbox)
+      if ! run_root_helper probe >/dev/null 2>&1; then
+        echo "The maintenance helper is missing. Run the latest generated host installer once, then retry this repair." >&2
+        return 127
+      fi
+      run_root_helper repair-virtualbox-access "${RUN_USER:-}"
+      [ ! -e /dev/vboxdrv ] || [ -r /dev/vboxdrv -a -w /dev/vboxdrv ] || {
+        echo "VirtualBox device permissions are still unavailable after repair." >&2
+        return 13
+      }
+      echo "VirtualBox access is ready for ${RUN_USER:-$(id -un)}."
       ;;
     script_run)
       value=$(json_payload_str body "$payload")
       [ -n "$value" ] || value="$payload"
       [ -n "$value" ] || { echo "script body is required"; return 2; }
-      tmp="/tmp/vmange-script.$$"
+      value=$(normalize_text "$value")
+      tmp=$(mktemp)
       printf '%s\n' "$value" > "$tmp"
       chmod 0700 "$tmp"
-      bash "$tmp"
+      local script_exit=0
+      bash "$tmp" || script_exit=$?
       rm -f "$tmp"
+      return "$script_exit"
       ;;
     terminal_exec)
       value=$(json_payload_str command "$payload")
       [ -n "$value" ] || value="$payload"
       [ -n "$value" ] || { echo "command is required"; return 2; }
-      bash -lc "$value"
+      value=$(normalize_text "$value")
+      echo "\$ $value"
+      if command -v timeout >/dev/null 2>&1; then
+        timeout 120 bash -lc "$value"
+      else
+        bash -lc "$value"
+      fi
       ;;
     agent_upgrade)
-      [ -n "$AGENT_URL" ] || { echo "VMANGE_AGENT_URL is not configured"; return 2; }
-      tmp="/tmp/vmange-agent.$$"
-      curl -fsSL "$AGENT_URL" -o "$tmp"
+      local requested_url expected_checksum expected_version trusted_prefix new_version download_headers
+      requested_url=$(json_payload_str url "$payload")
+      expected_checksum=$(json_payload_str sha256 "$payload")
+      expected_version=$(json_payload_str expected_version "$payload")
+      requested_url="${requested_url:-$AGENT_URL}"
+      [ -n "$requested_url" ] || { echo "VMANGE_AGENT_URL is not configured"; return 2; }
+      trusted_prefix="${AGENT_URL%/*}/"
+      case "$requested_url" in
+        "$AGENT_URL"|"$trusted_prefix"*|"${API_URL%/*}/release-download.php?version="*) ;;
+        *) echo "Refusing untrusted agent download URL: $requested_url" >&2; return 2 ;;
+      esac
+      [[ "$expected_checksum" =~ ^[a-fA-F0-9]{64}$ ]] || { echo 'A SHA-256 checksum is required' >&2; return 2; }
+      [[ "$expected_version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'An expected version is required' >&2; return 2; }
+      command -v sha256sum >/dev/null || { echo 'sha256sum is required' >&2; return 2; }
+      tmp=$(mktemp "${AGENT_PATH}.new.XXXXXX")
+      [[ "$TOKEN" =~ ^[a-fA-F0-9]{64}$ ]] && [[ "$HOSTNAME_VALUE" =~ ^[a-zA-Z0-9._-]+$ ]] || { rm -f "$tmp"; return 2; }
+      download_headers=$(mktemp)
+      chmod 0600 "$download_headers"
+      printf 'Authorization: Bearer %s\nX-VMange-Host: %s\n' "$TOKEN" "$HOSTNAME_VALUE" > "$download_headers"
+      if ! curl --proto '=https' --connect-timeout 15 --max-time 120 -fsS -H "@$download_headers" "$requested_url" -o "$tmp"; then rm -f "$tmp" "$download_headers"; return 1; fi
+      rm -f "$download_headers"
+      if ! printf '%s  %s\n' "$expected_checksum" "$tmp" | sha256sum -c -; then rm -f "$tmp"; return 2; fi
+      if ! bash -n "$tmp"; then rm -f "$tmp"; return 2; fi
       new_version=$(sed -n 's/^AGENT_VERSION="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$tmp" | head -n 1)
+      if [ -n "$expected_version" ] && [ "$new_version" != "$expected_version" ]; then
+        echo "Downloaded agent version mismatch: expected $expected_version, received ${new_version:-unknown}" >&2
+        rm -f "$tmp"
+        return 2
+      fi
       chmod 0755 "$tmp"
-      install -d -m 0750 "$(dirname "$AGENT_PATH")"
-      install -m 0755 "$tmp" "$AGENT_PATH"
+      cp -p "$AGENT_PATH" "${AGENT_PATH}.previous"
+      mv -f "$tmp" "$AGENT_PATH"
       ln -sf "$AGENT_PATH" /usr/local/bin/vmange-agent 2>/dev/null || true
       rm -f "$tmp"
       echo "agent upgraded to ${new_version:-unknown}"
@@ -1050,6 +1334,29 @@ PY
   esac
 }
 
+send_pending_result() {
+  local pending="${AGENT_PATH%/*}/state/result.pending" response code line
+  [ -f "$pending" ] || return 0
+  local -a fields=()
+  while IFS= read -r line; do fields+=("$(printf '%s' "$line" | base64 -d)"); done < "$pending"
+  [ "${#fields[@]}" -eq 9 ] || { echo 'Invalid pending command result; inspect private state directory' >&2; return 1; }
+  response=$(post_heartbeat "${fields[@]:0:8}") || return 1
+  code=$(printf '%s' "$response" | sed -n 's/^VMANGE_HTTP_CODE://p' | tail -n 1)
+  if [ "${code:-000}" -lt 200 ] || [ "${code:-000}" -ge 300 ]; then
+    if [ "$code" = '409' ]; then
+      mv "$pending" "$pending.rejected.$(date +%s)"
+      echo 'Command lease rejected. Result preserved in the private state directory for investigation.' >&2
+      return 1
+    fi
+    echo "Command result acknowledgement failed (HTTP ${code:-000}); result retained for retry" >&2
+    return 1
+  fi
+  rm -f "$pending"
+  if [ "${fields[8]}" = 'agent_upgrade' ] && [ "${fields[1]}" = 'done' ] && [ "${VMANGE_AGENT_MODE:-}" = 'loop' ]; then
+    exec "$AGENT_PATH" loop
+  fi
+}
+
 handle_response() {
   local response="$1"
   response=$(printf '%s\n' "$response" | awk 'NF{line=$0} END{print line}')
@@ -1058,9 +1365,9 @@ handle_response() {
     return 0
   fi
 
-  local version command_id action target_b64 payload_b64 target payload output status stdout stderr exit_code diagnostics out_file err_file
-  IFS='|' read -r version command_id action target_b64 payload_b64 <<< "$response"
-  if [ "$version" != "v2" ]; then
+  local version command_id action target_b64 payload_b64 target payload output status stdout stderr exit_code diagnostics out_file err_file lease_token
+  IFS='|' read -r version command_id action target_b64 payload_b64 lease_token <<< "$response"
+  if [ "$version" != "v2" ] && [ "$version" != "v3" ]; then
     IFS='|' read -r action target <<< "$response"
     command_id=""
     payload=""
@@ -1072,11 +1379,11 @@ handle_response() {
   out_file=$(mktemp)
   err_file=$(mktemp)
   set +e
-  run_command "$action" "$target" "$payload" >"$out_file" 2>"$err_file"
+  ( set -e; run_command "$action" "$target" "$payload" ) >"$out_file" 2>"$err_file"
   exit_code=$?
   set -e
-  stdout=$(cat "$out_file" 2>/dev/null || true)
-  stderr=$(cat "$err_file" 2>/dev/null || true)
+  stdout=$(head -c 65535 "$out_file" 2>/dev/null || true)
+  stderr=$(head -c 65535 "$err_file" 2>/dev/null || true)
   rm -f "$out_file" "$err_file"
   output="${stdout}${stderr:+$'\n'}${stderr}"
   diagnostics=$(printf '{"agent_version":"%s","action":"%s","target":"%s","exit_code":%d,"run_user":"%s","home":"%s","vboxmanage_bin":"%s"}' \
@@ -1087,7 +1394,15 @@ handle_response() {
     status="failed"
   fi
   if [ -n "$command_id" ]; then
-    post_heartbeat "$command_id" "$status" "$output" "$exit_code" "$stdout" "$stderr" "$diagnostics" >/dev/null || true
+    local pending_dir="${AGENT_PATH%/*}/state" pending_tmp field
+    install -d -m 0700 "$pending_dir"
+    pending_tmp=$(mktemp "$pending_dir/result.XXXXXX")
+    for field in "$command_id" "$status" "$output" "$exit_code" "$stdout" "$stderr" "$diagnostics" "$lease_token" "$action"; do
+      printf '%s' "$field" | base64 | tr -d '\n' >> "$pending_tmp"
+      printf '\n' >> "$pending_tmp"
+    done
+    mv -f "$pending_tmp" "$pending_dir/result.pending"
+    send_pending_result || return 1
   fi
   if [ "$action" = "agent_upgrade" ] && [ "$status" = "done" ] && [ "${VMANGE_AGENT_MODE:-}" = "loop" ]; then
     exec "$AGENT_PATH" loop
@@ -1102,6 +1417,12 @@ run_once() {
     echo "VMANGE_API_URL is required. Install through host-install.php or set it in /etc/vmange/agent.env." >&2
     return 2
   fi
+  if [ -z "$TOKEN" ]; then
+    echo "VMANGE_TOKEN is required. Re-enroll this host from the VMange dashboard." >&2
+    return 2
+  fi
+  case "$API_URL" in https://*) ;; *) echo 'Agent API requires HTTPS' >&2; return 2 ;; esac
+  send_pending_result || return 1
   local response
   response=$(post_heartbeat)
   local http_code body
@@ -1117,6 +1438,12 @@ run_once() {
   response="$body"
   handle_response "$response"
 }
+
+if [ "${1:-once}" != "metrics" ]; then
+  install -d -m 0700 "${AGENT_PATH%/*}/state"
+  exec 9>"${AGENT_PATH%/*}/state/agent.lock"
+  flock -n 9 || { echo 'An agent instance is already polling for this installation.' >&2; exit 0; }
+fi
 
 if [ "${1:-once}" = "metrics" ]; then
   collect_metrics "$(collect_running_vms)"

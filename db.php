@@ -1,6 +1,9 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/agent-auth.php';
+require_once __DIR__ . '/releases.php';
+
 error_reporting(E_ALL);
 ini_set('display_errors', getenv('VBOX_DEBUG') === '1' ? '1' : '0');
 ini_set('log_errors', '1');
@@ -28,17 +31,25 @@ function app_config(): array
         'db_name' => app_env('VBOX_DB_NAME', 'vmange'),
         'db_user' => app_env('VBOX_DB_USER', 'vmange'),
         'db_pass' => app_env('VBOX_DB_PASS', 'change-me'),
-        'legacy_agent_token' => app_env('VBOX_AGENT_TOKEN', 'change-me-agent-token'),
+        'legacy_agent_token' => app_env('VBOX_AGENT_TOKEN', ''),
         'setup_token' => app_env('VBOX_SETUP_TOKEN', ''),
         'rate_limit_window' => (int) app_env('VBOX_RATE_LIMIT_WINDOW', '60'),
         'rate_limit_max' => (int) app_env('VBOX_RATE_LIMIT_MAX', '90'),
         'online_window_seconds' => (int) app_env('VBOX_ONLINE_WINDOW', '120'),
+        'metrics_retention_hours' => max(1, (int) app_env('VBOX_METRICS_RETENTION_HOURS', '6')),
+        'cron_secret' => app_env('VBOX_CRON_SECRET', ''),
+        'encryption_key' => app_env('VBOX_ENCRYPTION_KEY', ''),
+        'release_storage' => app_env('VBOX_RELEASE_STORAGE', ''),
+        'webhook_url' => app_env('VBOX_WEBHOOK_URL', ''),
+        'webhook_secret' => app_env('VBOX_WEBHOOK_SECRET', ''),
+        'terminal_enabled' => app_env('VBOX_TERMINAL_ENABLED', '0') === '1',
         'gateway_url' => app_env('VBOX_GATEWAY_URL', ''),
         'terminal_gateway_enabled' => app_env('VBOX_TERMINAL_GATEWAY_ENABLED', '0') === '1',
         'terminal_gateway_url' => app_env('VBOX_TERMINAL_GATEWAY_URL', ''),
         'terminal_gateway_token' => app_env('VBOX_TERMINAL_GATEWAY_TOKEN', ''),
         'docs_enabled' => app_env('VBOX_DOCS_ENABLED', '1') !== '0',
         'mail_from' => app_env('VBOX_MAIL_FROM', ''),
+        'mail_transport' => app_env('VBOX_MAIL_TRANSPORT', 'smtp'),
         'smtp_host' => app_env('VBOX_SMTP_HOST', ''),
         'smtp_port' => (int) app_env('VBOX_SMTP_PORT', '587'),
         'smtp_username' => app_env('VBOX_SMTP_USERNAME', ''),
@@ -62,6 +73,14 @@ function app_config(): array
         }
     }
 
+    foreach (['gateway_url','terminal_gateway_url'] as $key) {
+        $url=(string)($defaults[$key] ?? '');
+        if ($url==='') continue;
+        $parts=parse_url($url);
+        if (!filter_var($url,FILTER_VALIDATE_URL) || ($parts['scheme'] ?? '')!=='https' || isset($parts['user']) || isset($parts['pass']) || isset($parts['query']) || isset($parts['fragment'])) {
+            throw new RuntimeException($key . ' must be an HTTPS URL without embedded credentials or query tokens');
+        }
+    }
     $config = $defaults;
     return $config;
 }
@@ -74,6 +93,8 @@ function secure_session_start(): void
 
     $config = app_config();
     $secure = is_https();
+    ini_set('session.use_strict_mode', '1');
+    ini_set('session.use_only_cookies', '1');
     session_name($config['session_name']);
     session_set_cookie_params([
         'lifetime' => 0,
@@ -88,8 +109,7 @@ function secure_session_start(): void
 
 function is_https(): bool
 {
-    return (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
-        || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+    return agent_request_is_https();
 }
 
 function base_path(): string
@@ -106,6 +126,7 @@ function base_url(string $path = ''): string
     if ($base === '') {
         $scheme = is_https() ? 'https' : 'http';
         $host = $_SERVER['HTTP_HOST'] ?? 'localhost';
+        if (!preg_match('/^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$/D', $host)) throw new RuntimeException('Invalid request host');
         $base = $scheme . '://' . $host . rtrim(base_path(), '/');
     }
     return $base . '/' . ltrim($path, '/');
@@ -123,11 +144,9 @@ function db(): mysqli
     $conn = new mysqli($config['db_host'], $config['db_user'], $config['db_pass'], $config['db_name']);
     $conn->set_charset('utf8mb4');
     ensure_runtime_schema($conn);
+    release_schema($conn);
     return $conn;
 }
-
-$conn = db();
-$TOKEN = app_config()['legacy_agent_token'];
 
 function ensure_runtime_schema(mysqli $conn): void
 {
@@ -270,9 +289,19 @@ function ensure_runtime_schema(mysqli $conn): void
             `recipient` varchar(255) DEFAULT NULL,
             `status` varchar(32) NOT NULL DEFAULT 'pending',
             `result` text DEFAULT NULL,
+            `subject` varchar(255) DEFAULT NULL,
+            `body` text DEFAULT NULL,
+            `attempts` int NOT NULL DEFAULT 0,
+            `next_attempt_at` datetime DEFAULT NULL,
             `created_at` datetime DEFAULT current_timestamp(),
+            `updated_at` datetime DEFAULT NULL,
             PRIMARY KEY (`id`),
             KEY `alarm_event_id` (`alarm_event_id`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
+        "CREATE TABLE IF NOT EXISTS `vbox_schema_migrations` (
+            `version` varchar(64) NOT NULL,
+            `applied_at` datetime NOT NULL DEFAULT current_timestamp(),
+            PRIMARY KEY (`version`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci",
     ];
 
@@ -285,6 +314,7 @@ function ensure_runtime_schema(mysqli $conn): void
     }
 
     $hostColumns = [
+        'host_uuid' => "ALTER TABLE `vbox_hosts` ADD COLUMN `host_uuid` char(36) DEFAULT NULL",
         'all_vms' => "ALTER TABLE `vbox_hosts` ADD COLUMN `all_vms` text DEFAULT NULL",
         'running_vms' => "ALTER TABLE `vbox_hosts` ADD COLUMN `running_vms` text DEFAULT NULL",
         'vm_specs' => "ALTER TABLE `vbox_hosts` ADD COLUMN `vm_specs` longtext DEFAULT NULL",
@@ -337,6 +367,12 @@ function ensure_runtime_schema(mysqli $conn): void
         'stdout' => "ALTER TABLE `vbox_commands` ADD COLUMN `stdout` mediumtext DEFAULT NULL",
         'stderr' => "ALTER TABLE `vbox_commands` ADD COLUMN `stderr` mediumtext DEFAULT NULL",
         'diagnostics_json' => "ALTER TABLE `vbox_commands` ADD COLUMN `diagnostics_json` longtext DEFAULT NULL",
+        'lease_token_hash' => "ALTER TABLE `vbox_commands` ADD COLUMN `lease_token_hash` char(64) DEFAULT NULL",
+        'lease_expires_at' => "ALTER TABLE `vbox_commands` ADD COLUMN `lease_expires_at` datetime DEFAULT NULL",
+        'attempts' => "ALTER TABLE `vbox_commands` ADD COLUMN `attempts` int NOT NULL DEFAULT 0",
+        'progress_message' => "ALTER TABLE `vbox_commands` ADD COLUMN `progress_message` varchar(255) DEFAULT NULL",
+        'progress_percent' => "ALTER TABLE `vbox_commands` ADD COLUMN `progress_percent` tinyint DEFAULT NULL",
+        'error_code' => "ALTER TABLE `vbox_commands` ADD COLUMN `error_code` varchar(64) DEFAULT NULL",
     ];
     foreach ($commandColumns as $column => $sql) {
         if (!runtime_column_exists($conn, 'vbox_commands', $column)) {
@@ -347,24 +383,116 @@ function ensure_runtime_schema(mysqli $conn): void
             }
         }
     }
-    try {
-        $conn->query("ALTER TABLE `vbox_commands` MODIFY `status` enum('pending','sent','running','done','failed','expired') NOT NULL DEFAULT 'pending'");
-    } catch (Throwable $e) {
-        error_log('VMange ensure_runtime_schema command status enum failed: ' . $e->getMessage());
+    $deliveryColumns = [
+        'subject' => "ALTER TABLE `vbox_notification_deliveries` ADD COLUMN `subject` varchar(255) DEFAULT NULL",
+        'body' => "ALTER TABLE `vbox_notification_deliveries` ADD COLUMN `body` text DEFAULT NULL",
+        'attempts' => "ALTER TABLE `vbox_notification_deliveries` ADD COLUMN `attempts` int NOT NULL DEFAULT 0",
+        'next_attempt_at' => "ALTER TABLE `vbox_notification_deliveries` ADD COLUMN `next_attempt_at` datetime DEFAULT NULL",
+        'updated_at' => "ALTER TABLE `vbox_notification_deliveries` ADD COLUMN `updated_at` datetime DEFAULT NULL",
+    ];
+    foreach ($deliveryColumns as $column => $sql) {
+        if (!runtime_column_exists($conn, 'vbox_notification_deliveries', $column)) {
+            try {
+                $conn->query($sql);
+            } catch (Throwable $e) {
+                error_log('VMange notification delivery column failed for ' . $column . ': ' . $e->getMessage());
+            }
+        }
     }
+    $statusType = runtime_column_type($conn, 'vbox_commands', 'status');
+    if ($statusType !== null && (
+        !str_contains($statusType, "'sent'")
+        || !str_contains($statusType, "'running'")
+        || !str_contains($statusType, "'expired'")
+    )) {
+        try {
+            $conn->query("ALTER TABLE `vbox_commands` MODIFY `status` enum('pending','sent','running','done','failed','expired') NOT NULL DEFAULT 'pending'");
+        } catch (Throwable $e) {
+            error_log('VMange ensure_runtime_schema command status enum failed: ' . $e->getMessage());
+        }
+    }
+
+    apply_versioned_migrations($conn);
 
     $done = true;
 }
 
-function runtime_column_exists(mysqli $conn, string $table, string $column): bool
+function apply_versioned_migrations(mysqli $conn): void
+{
+    if (!runtime_table_exists($conn, 'vbox_schema_migrations')) {
+        return;
+    }
+    $dir = __DIR__ . DIRECTORY_SEPARATOR . 'db' . DIRECTORY_SEPARATOR . 'migrations';
+    if (!is_dir($dir)) {
+        return;
+    }
+    $files = glob($dir . DIRECTORY_SEPARATOR . '*.sql') ?: [];
+    sort($files, SORT_STRING);
+    foreach ($files as $file) {
+        $version = pathinfo($file, PATHINFO_FILENAME);
+        $stmt = $conn->prepare('SELECT 1 FROM vbox_schema_migrations WHERE version=? LIMIT 1');
+        $stmt->bind_param('s', $version);
+        $stmt->execute();
+        if ($stmt->get_result()->fetch_row()) {
+            continue;
+        }
+        $sql = (string) file_get_contents($file);
+        if (trim($sql) === '') {
+            continue;
+        }
+        try {
+            $conn->begin_transaction();
+            if (!$conn->multi_query($sql)) {
+                throw new RuntimeException('Migration query failed');
+            }
+            while ($conn->more_results() && $conn->next_result()) {
+                if ($conn->errno) {
+                    throw new RuntimeException($conn->error);
+                }
+            }
+            $stmt = $conn->prepare('INSERT INTO vbox_schema_migrations(version) VALUES (?)');
+            $stmt->bind_param('s', $version);
+            $stmt->execute();
+            $conn->commit();
+        } catch (Throwable $e) {
+            $conn->rollback();
+            error_log('VMange migration ' . $version . ' failed: ' . $e->getMessage());
+        }
+    }
+}
+
+function runtime_table_exists(mysqli $conn, string $table): bool
 {
     try {
-        $stmt = $conn->prepare("SHOW COLUMNS FROM `$table` LIKE ?");
-        $stmt->bind_param('s', $column);
+        $stmt = $conn->prepare('SELECT 1 FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? LIMIT 1');
+        $stmt->bind_param('s', $table);
         $stmt->execute();
-        return $stmt->get_result()->num_rows > 0;
+        return (bool) $stmt->get_result()->fetch_row();
     } catch (Throwable $e) {
         return false;
+    }
+}
+
+function runtime_column_exists(mysqli $conn, string $table, string $column): bool
+{
+    return runtime_column_type($conn, $table, $column) !== null;
+}
+
+function runtime_column_type(mysqli $conn, string $table, string $column): ?string
+{
+    try {
+        $stmt = $conn->prepare(
+            'SELECT COLUMN_TYPE
+             FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+             LIMIT 1'
+        );
+        $stmt->bind_param('ss', $table, $column);
+        $stmt->execute();
+        $row = $stmt->get_result()->fetch_assoc();
+        return $row ? strtolower((string) $row['COLUMN_TYPE']) : null;
+    } catch (Throwable $e) {
+        return null;
     }
 }
 
@@ -377,7 +505,7 @@ function setting_value(string $key, ?string $default = null): ?string
     $stmt->bind_param('s', $key);
     $stmt->execute();
     $row = $stmt->get_result()->fetch_assoc();
-    return $row ? (string) $row['setting_value'] : $default;
+    return $row ? decrypt_secret_value((string) $row['setting_value']) : $default;
 }
 
 function save_setting(string $key, string $value): void
@@ -385,6 +513,60 @@ function save_setting(string $key, string $value): void
     $stmt = db()->prepare('INSERT INTO vbox_settings(setting_key, setting_value, updated_at) VALUES (?, ?, NOW()) ON DUPLICATE KEY UPDATE setting_value=VALUES(setting_value), updated_at=NOW()');
     $stmt->bind_param('ss', $key, $value);
     $stmt->execute();
+}
+
+function secret_key_material(): string
+{
+    $configured = trim((string) (app_config()['encryption_key'] ?? ''));
+    if (strlen($configured) < 32 || str_starts_with($configured, 'replace-with-')) {
+        throw new RuntimeException('VBOX_ENCRYPTION_KEY must be a dedicated secret of at least 32 characters');
+    }
+    return $configured;
+}
+
+function encrypt_secret_value(string $value): string
+{
+    if ($value === '') {
+        return $value;
+    }
+    if (!function_exists('openssl_encrypt')) {
+        throw new RuntimeException('OpenSSL is required to store secrets');
+    }
+    $key = hash('sha256', secret_key_material(), true);
+    $iv = random_bytes(12);
+    $tag = '';
+    $cipher = openssl_encrypt($value, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    if ($cipher === false) {
+        throw new RuntimeException('Secret encryption failed');
+    }
+    return 'enc:v1:' . base64_encode($iv . $tag . $cipher);
+}
+
+function decrypt_secret_value(string $value): string
+{
+    if (!str_starts_with($value, 'enc:v1:')) {
+        return $value;
+    }
+    if (!function_exists('openssl_decrypt')) throw new RuntimeException('OpenSSL is required to read encrypted settings');
+    $raw = base64_decode(substr($value, 7), true);
+    if ($raw === false || strlen($raw) < 28) {
+        throw new RuntimeException('Saved secret is damaged; restore it from a trusted backup');
+    }
+    $key = hash('sha256', secret_key_material(), true);
+    $iv = substr($raw, 0, 12);
+    $tag = substr($raw, 12, 16);
+    $cipher = substr($raw, 28);
+    $plain = openssl_decrypt($cipher, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $iv, $tag);
+    if ($plain === false) throw new RuntimeException('Saved secret could not be decrypted; verify the encryption key');
+    return $plain;
+}
+
+function save_secret_setting(string $key, string $value): void
+{
+    if ($value === '') {
+        return;
+    }
+    save_setting($key, encrypt_secret_value($value));
 }
 
 function e(?string $value): string
@@ -426,9 +608,25 @@ function verify_csrf(): void
 function require_login(bool $json = false): void
 {
     secure_session_start();
-    if (!empty($_SESSION['vbox_logged_in'])) {
-        return;
+    if (!empty($_SESSION['vbox_logged_in']) && !empty($_SESSION['vbox_user_id'])) {
+        $lastCheck = (int) ($_SESSION['vbox_identity_checked_at'] ?? 0);
+        if ($lastCheck > time() - 60) {
+            return;
+        }
+        $userId = (int) $_SESSION['vbox_user_id'];
+        $stmt = db()->prepare('SELECT username, role FROM vbox_users WHERE id=? LIMIT 1');
+        $stmt->bind_param('i', $userId);
+        $stmt->execute();
+        $identity = $stmt->get_result()->fetch_assoc();
+        if ($identity) {
+            $_SESSION['vbox_user'] = $identity['username'];
+            $_SESSION['vbox_role'] = $identity['role'] ?? 'viewer';
+            $_SESSION['vbox_identity_checked_at'] = time();
+            return;
+        }
     }
+    $_SESSION = [];
+    session_destroy();
     if ($json) {
         json_response(['ok' => false, 'error' => 'Authentication required'], 401);
     }
@@ -447,6 +645,23 @@ function can_manage(): bool
     return in_array(current_user_role(), ['admin', 'operator'], true);
 }
 
+function action_required_role(string $action): string
+{
+    $adminActions = [
+        'vm_delete', 'agent_upgrade', 'agent_uninstall',
+        'host_install_virtualbox', 'host_repair_virtualbox', 'host_install_docker',
+        'agent_restart', 'host_reboot', 'host_wol_send', 'script_run', 'terminal_exec',
+        'container_remove', 'image_remove', 'compose_down',
+    ];
+    return in_array($action, $adminActions, true) ? 'admin' : 'operator';
+}
+
+function role_allows_action(string $role, string $action): bool
+{
+    $rank = ['viewer' => 0, 'operator' => 1, 'admin' => 2];
+    return ($rank[$role] ?? 0) >= $rank[action_required_role($action)];
+}
+
 function client_ip(): string
 {
     return substr($_SERVER['REMOTE_ADDR'] ?? 'unknown', 0, 64);
@@ -458,8 +673,16 @@ function table_exists(string $table): bool
     if (array_key_exists($table, $cache)) {
         return $cache[$table];
     }
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+        return false;
+    }
     try {
-        $stmt = db()->prepare('SHOW TABLES LIKE ?');
+        $stmt = db()->prepare(
+            'SELECT 1
+             FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+             LIMIT 1'
+        );
         $stmt->bind_param('s', $table);
         $stmt->execute();
         $cache[$table] = $stmt->get_result()->num_rows > 0;
@@ -480,9 +703,17 @@ function column_exists(string $table, string $column): bool
     if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
         return false;
     }
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $column)) {
+        return false;
+    }
     try {
-        $stmt = db()->prepare("SHOW COLUMNS FROM `$table` LIKE ?");
-        $stmt->bind_param('s', $column);
+        $stmt = db()->prepare(
+            'SELECT 1
+             FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+             LIMIT 1'
+        );
+        $stmt->bind_param('ss', $table, $column);
         $stmt->execute();
         $cache[$key] = $stmt->get_result()->num_rows > 0;
     } catch (Throwable $e) {
@@ -524,7 +755,7 @@ function allowed_actions(): array
         'image_pull', 'image_remove',
         'compose_up', 'compose_down', 'compose_pull',
         'compose_restart', 'compose_deploy', 'dockerfile_deploy', 'logs_tail',
-        'host_install_virtualbox', 'host_install_docker', 'host_refresh_inventory', 'agent_restart',
+        'host_install_virtualbox', 'host_repair_virtualbox', 'host_install_docker', 'host_refresh_inventory', 'agent_restart',
         'host_reboot', 'host_wol_send',
         'script_run', 'terminal_exec',
         'agent_upgrade', 'agent_uninstall',
@@ -539,7 +770,7 @@ function is_destructive_action(string $action): bool
         'vm_attach_iso', 'vm_detach_iso', 'vm_attach_disk', 'vm_create_disk', 'vm_resize_disk',
         'vm_set_network', 'vm_cable_connected', 'vm_export', 'vm_import', 'vm_create', 'vm_disable_vrde',
         'container_kill', 'container_remove', 'image_remove', 'compose_down', 'compose_deploy', 'dockerfile_deploy',
-        'host_install_virtualbox', 'host_install_docker', 'agent_restart', 'host_reboot', 'script_run', 'terminal_exec', 'agent_uninstall',
+        'host_install_virtualbox', 'host_repair_virtualbox', 'host_install_docker', 'agent_restart', 'host_reboot', 'script_run', 'terminal_exec', 'agent_uninstall',
     ], true);
 }
 
@@ -634,25 +865,7 @@ function expire_stale_commands(?string $hostname = null, int $ageSeconds = 180):
 
 function verify_agent_token(string $hostname, string $token): bool
 {
-    if ($token === '') {
-        return false;
-    }
-
-    $legacy = (string) app_config()['legacy_agent_token'];
-    if ($legacy !== '' && hash_equals($legacy, $token)) {
-        return true;
-    }
-
-    if (table_exists('vbox_host_tokens')) {
-        $stmt = db()->prepare('SELECT token_hash FROM vbox_host_tokens WHERE hostname=? AND active=1 ORDER BY id DESC LIMIT 1');
-        $stmt->bind_param('s', $hostname);
-        $stmt->execute();
-        if ($row = $stmt->get_result()->fetch_assoc()) {
-            return hash_equals($row['token_hash'], hash('sha256', $token));
-        }
-    }
-
-    return false;
+    return !host_is_blocked($hostname) && agent_token_valid(db(), $hostname, $token);
 }
 
 function host_is_blocked(string $hostname): bool
@@ -665,7 +878,7 @@ function host_is_blocked(string $hostname): bool
         return (bool) $stmt->get_result()->fetch_row();
     } catch (Throwable $e) {
         error_log('VMange host block check failed: ' . $e->getMessage());
-        return false;
+        return true;
     }
 }
 

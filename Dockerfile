@@ -4,11 +4,15 @@ RUN docker-php-ext-install mysqli
 
 ENV VBOX_BASE_URL=http://localhost:8080 \
     VBOX_FORCE_HTTPS=0 \
+    VBOX_CRON_SECRET= \
+    VBOX_METRICS_RETENTION_HOURS=6 \
+    VBOX_ENCRYPTION_KEY= \
+    VBOX_WEBHOOK_URL= \
+    VBOX_WEBHOOK_SECRET= \
     VBOX_DB_HOST=db \
     VBOX_DB_NAME=vmange \
     VBOX_DB_USER=vmange \
-    VBOX_DB_PASS=change-me \
-    VBOX_AGENT_TOKEN=change-me \
+    VBOX_DB_PASS= \
     VBOX_MAIL_FROM= \
     VBOX_SMTP_HOST= \
     VBOX_SMTP_PORT=587 \

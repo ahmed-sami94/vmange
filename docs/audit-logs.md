@@ -10,6 +10,6 @@ Audit gives a record of dashboard actions, while operation logs show command pro
 - `expired` means it aged out before completion.
 
 ## Reading results
-Hover or focus a status badge on desktop to see the reason. On mobile, tap the info hint beside the badge to reveal the same message.
+Hover or focus a status badge on desktop to see the reason. On mobile, tap the info hint beside the badge to reveal the same message. Use **View** for the complete exit code, timestamps, stdout, stderr, and host diagnostics.
 
 Use the Alarms page for threshold policy history and current notifications.

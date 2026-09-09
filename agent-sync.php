@@ -1,6 +1,9 @@
 <?php
 declare(strict_types=1);
 
+require_once __DIR__ . '/agent-auth.php';
+require_once __DIR__ . '/releases.php';
+
 header('X-Content-Type-Options: nosniff');
 header('X-VMange-Agent-Sync: 2026-05-12-direct-heartbeat');
 
@@ -28,6 +31,7 @@ function sync_config(): array
         'db_user' => sync_env('VBOX_DB_USER', 'vmange'),
         'db_pass' => sync_env('VBOX_DB_PASS', 'change-me'),
         'legacy_agent_token' => sync_env('VBOX_AGENT_TOKEN', ''),
+        'metrics_retention_hours' => max(1, (int) sync_env('VBOX_METRICS_RETENTION_HOURS', '6')),
     ];
 
     foreach ([dirname(__DIR__) . DIRECTORY_SEPARATOR . 'vbox-config.php', __DIR__ . DIRECTORY_SEPARATOR . 'config.php'] as $file) {
@@ -54,6 +58,7 @@ function sync_db(): mysqli
     $conn = new mysqli($cfg['db_host'], $cfg['db_user'], $cfg['db_pass'], $cfg['db_name']);
     $conn->set_charset('utf8mb4');
     sync_ensure_schema($conn);
+    release_schema($conn);
     return $conn;
 }
 
@@ -63,8 +68,16 @@ function sync_table_exists(string $table): bool
     if (array_key_exists($table, $cache)) {
         return $cache[$table];
     }
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table)) {
+        return false;
+    }
     try {
-        $stmt = sync_db()->prepare('SHOW TABLES LIKE ?');
+        $stmt = sync_db()->prepare(
+            'SELECT 1
+             FROM information_schema.TABLES
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
+             LIMIT 1'
+        );
         $stmt->bind_param('s', $table);
         $stmt->execute();
         $cache[$table] = $stmt->get_result()->num_rows > 0;
@@ -91,18 +104,32 @@ function sync_host_is_blocked(string $hostname): bool
 
 function sync_column_exists(string $table, string $column): bool
 {
+    return sync_column_type($table, $column) !== null;
+}
+
+function sync_column_type(string $table, string $column): ?string
+{
     static $cache = [];
     $key = $table . '.' . $column;
     if (array_key_exists($key, $cache)) {
         return $cache[$key];
     }
+    if (!preg_match('/^[A-Za-z0-9_]+$/', $table) || !preg_match('/^[A-Za-z0-9_]+$/', $column)) {
+        return null;
+    }
     try {
-        $stmt = sync_db()->prepare("SHOW COLUMNS FROM `$table` LIKE ?");
-        $stmt->bind_param('s', $column);
+        $stmt = sync_db()->prepare(
+            'SELECT COLUMN_TYPE
+             FROM information_schema.COLUMNS
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?
+             LIMIT 1'
+        );
+        $stmt->bind_param('ss', $table, $column);
         $stmt->execute();
-        $cache[$key] = $stmt->get_result()->num_rows > 0;
+        $row = $stmt->get_result()->fetch_assoc();
+        $cache[$key] = $row ? strtolower((string) $row['COLUMN_TYPE']) : null;
     } catch (Throwable $e) {
-        $cache[$key] = false;
+        $cache[$key] = null;
     }
     return $cache[$key];
 }
@@ -146,6 +173,7 @@ function sync_ensure_schema(mysqli $conn): void
     }
 
     $hostColumns = [
+        'host_uuid' => "ALTER TABLE `vbox_hosts` ADD COLUMN `host_uuid` char(36) DEFAULT NULL",
         'all_vms' => "ALTER TABLE `vbox_hosts` ADD COLUMN `all_vms` text DEFAULT NULL",
         'running_vms' => "ALTER TABLE `vbox_hosts` ADD COLUMN `running_vms` text DEFAULT NULL",
         'vm_specs' => "ALTER TABLE `vbox_hosts` ADD COLUMN `vm_specs` longtext DEFAULT NULL",
@@ -183,6 +211,12 @@ function sync_ensure_schema(mysqli $conn): void
         'stdout' => "ALTER TABLE `vbox_commands` ADD COLUMN `stdout` mediumtext DEFAULT NULL",
         'stderr' => "ALTER TABLE `vbox_commands` ADD COLUMN `stderr` mediumtext DEFAULT NULL",
         'diagnostics_json' => "ALTER TABLE `vbox_commands` ADD COLUMN `diagnostics_json` longtext DEFAULT NULL",
+        'lease_token_hash' => "ALTER TABLE `vbox_commands` ADD COLUMN `lease_token_hash` char(64) DEFAULT NULL",
+        'lease_expires_at' => "ALTER TABLE `vbox_commands` ADD COLUMN `lease_expires_at` datetime DEFAULT NULL",
+        'attempts' => "ALTER TABLE `vbox_commands` ADD COLUMN `attempts` int NOT NULL DEFAULT 0",
+        'progress_message' => "ALTER TABLE `vbox_commands` ADD COLUMN `progress_message` varchar(255) DEFAULT NULL",
+        'progress_percent' => "ALTER TABLE `vbox_commands` ADD COLUMN `progress_percent` tinyint DEFAULT NULL",
+        'error_code' => "ALTER TABLE `vbox_commands` ADD COLUMN `error_code` varchar(64) DEFAULT NULL",
     ];
     foreach ($commandColumns as $column => $sql) {
         if (!sync_column_exists('vbox_commands', $column)) {
@@ -192,9 +226,16 @@ function sync_ensure_schema(mysqli $conn): void
             }
         }
     }
-    try {
-        $conn->query("ALTER TABLE `vbox_commands` MODIFY `status` enum('pending','sent','running','done','failed','expired') NOT NULL DEFAULT 'pending'");
-    } catch (Throwable $e) {
+    $statusType = sync_column_type('vbox_commands', 'status');
+    if ($statusType !== null && (
+        !str_contains($statusType, "'sent'")
+        || !str_contains($statusType, "'running'")
+        || !str_contains($statusType, "'expired'")
+    )) {
+        try {
+            $conn->query("ALTER TABLE `vbox_commands` MODIFY `status` enum('pending','sent','running','done','failed','expired') NOT NULL DEFAULT 'pending'");
+        } catch (Throwable $e) {
+        }
     }
 
     $done = true;
@@ -422,10 +463,7 @@ if (sync_host_is_blocked($hostname)) {
 }
 
 $token = (string) ($_POST['token'] ?? '');
-if ($token === '') {
-    http_response_code(403);
-    exit('forbidden');
-}
+require_agent_identity(sync_db(), $hostname, $token);
 
 $allVms = sync_b64('all_vms');
 $runningVms = sync_b64('running_vms');
@@ -487,17 +525,23 @@ $debug = json_encode([
     'posted_at' => date('c'),
 ], JSON_UNESCAPED_SLASHES);
 
+$hostUuid = strtolower(trim((string) ($_POST['host_uuid'] ?? '')));
+if ($hostUuid !== '' && !preg_match('/^[a-f0-9-]{16,64}$/', $hostUuid)) {
+    $hostUuid = '';
+}
+
 $conn = sync_db();
 $stmt = $conn->prepare("
-    INSERT INTO vbox_hosts(hostname, all_vms, running_vms, vm_specs, last_seen)
-    VALUES (?, ?, ?, ?, NOW())
+    INSERT INTO vbox_hosts(hostname, host_uuid, all_vms, running_vms, vm_specs, last_seen)
+    VALUES (?, NULLIF(?, ''), ?, ?, ?, NOW())
     ON DUPLICATE KEY UPDATE
+        host_uuid=COALESCE(NULLIF(VALUES(host_uuid), ''), host_uuid),
         all_vms=VALUES(all_vms),
         running_vms=VALUES(running_vms),
         vm_specs=VALUES(vm_specs),
         last_seen=NOW()
 ");
-$stmt->bind_param('ssss', $hostname, $allVms, $runningVms, $vmSpecs);
+$stmt->bind_param('sssss', $hostname, $hostUuid, $allVms, $runningVms, $vmSpecs);
 $stmt->execute();
 
 foreach ([
@@ -566,6 +610,8 @@ if ($metrics !== [] && sync_table_exists('vbox_metrics')) {
         ");
         $stmt->bind_param('sddiiiiiiii', $hostname, $cpu, $load1, $ramUsed, $ramTotal, $swapUsed, $swapTotal, $diskUsed, $diskTotal, $rx, $tx);
         $stmt->execute();
+        $retention = max(1, (int) (sync_config()['metrics_retention_hours'] ?? 6));
+        $conn->query("DELETE FROM vbox_metrics WHERE created_at < DATE_SUB(NOW(), INTERVAL {$retention} HOUR)");
     } catch (Throwable $e) {
     }
 }
@@ -585,14 +631,35 @@ if ($commandId > 0) {
     } catch (Throwable $e) {
     }
     $commandStatus = in_array(($_POST['command_status'] ?? ''), ['done', 'failed'], true) ? $_POST['command_status'] : 'failed';
-    $commandOutput = substr(sync_b64('command_output'), 0, 4000);
+    $commandOutput = substr(sync_b64('command_output'), 0, 65535);
     $exitCode = isset($_POST['command_exit_code']) ? (int) $_POST['command_exit_code'] : ($commandStatus === 'done' ? 0 : 1);
     $stdout = substr(sync_b64('command_stdout'), 0, 65535);
     $stderr = substr(sync_b64('command_stderr'), 0, 65535);
     $diagnostics = substr(sync_b64('command_diagnostics_json'), 0, 65535);
-    $stmt = $conn->prepare('UPDATE vbox_commands SET status=?, result=?, exit_code=?, stdout=?, stderr=?, diagnostics_json=?, finished_at=NOW(), updated_at=NOW() WHERE id=? AND hostname=?');
-    $stmt->bind_param('ssisssis', $commandStatus, $commandOutput, $exitCode, $stdout, $stderr, $diagnostics, $commandId, $hostname);
+    $leaseToken = (string) ($_POST['command_lease_token'] ?? '');
+    $leaseHash = $leaseToken !== '' ? hash('sha256', $leaseToken) : '';
+    if (sync_column_exists('vbox_commands', 'lease_token_hash') && $leaseHash !== '') {
+        $errorCode = $commandStatus === 'done' ? '' : 'agent_command_failed';
+        $stmt = $conn->prepare("UPDATE vbox_commands SET status=?, result=?, exit_code=?, stdout=?, stderr=?, diagnostics_json=?, error_code=?, finished_at=NOW(), updated_at=NOW(), lease_expires_at=NULL WHERE id=? AND hostname=? AND lease_token_hash=? AND status='running' AND lease_expires_at>=NOW()");
+        $stmt->bind_param('ssissssiss', $commandStatus, $commandOutput, $exitCode, $stdout, $stderr, $diagnostics, $errorCode, $commandId, $hostname, $leaseHash);
+    } else {
+        $stmt = $conn->prepare("UPDATE vbox_commands SET status=?, result=?, exit_code=?, stdout=?, stderr=?, diagnostics_json=?, finished_at=NOW(), updated_at=NOW() WHERE id=? AND hostname=? AND lease_token_hash IS NULL AND status IN ('sent','running')");
+        $stmt->bind_param('ssisssis', $commandStatus, $commandOutput, $exitCode, $stdout, $stderr, $diagnostics, $commandId, $hostname);
+    }
     $stmt->execute();
+    if ($stmt->affected_rows !== 1) {
+        if ($leaseHash !== '') {
+            $previous = $conn->prepare('SELECT status FROM vbox_commands WHERE id=? AND hostname=? AND lease_token_hash=?');
+            $previous->execute([$commandId,$hostname,$leaseHash]);
+            if (($previous->get_result()->fetch_assoc()['status'] ?? '') === $commandStatus) {
+                release_observe($conn,$hostname,(string)($metrics['agent_version'] ?? ''));
+                echo 'none|ack';
+                exit;
+            }
+        }
+        http_response_code(409);
+        exit('Command result rejected: expired, completed, or incorrect lease');
+    }
     if (sync_table_exists('vbox_script_runs')) {
         try {
             $stmt = $conn->prepare('UPDATE vbox_script_runs SET status=?, result=?, updated_at=NOW() WHERE command_id=? AND hostname=?');
@@ -614,26 +681,46 @@ if ($commandId > 0) {
     }
 }
 
+release_observe($conn, $hostname, (string) ($metrics['agent_version'] ?? ''));
+// Result acknowledgements must not silently claim a second command.
+if ($commandId > 0) {
+    echo "none|ack";
+    exit;
+}
 $payloadSql = sync_column_exists('vbox_commands', 'payload') ? ', payload' : ', NULL AS payload';
-$cmd = $conn->prepare("
-    SELECT id, action, vmname{$payloadSql}
-    FROM vbox_commands
-    WHERE hostname=? AND status='pending'
-    ORDER BY id ASC
-    LIMIT 1
-");
-$cmd->bind_param('s', $hostname);
-$cmd->execute();
-$result = $cmd->get_result();
+$row = null;
+$leaseToken = '';
+try {
+    if (sync_column_exists('vbox_commands', 'lease_expires_at')) {
+        $conn->query("UPDATE vbox_commands SET status='expired', updated_at=NOW() WHERE hostname='" . $conn->real_escape_string($hostname) . "' AND status='running' AND lease_expires_at IS NOT NULL AND lease_expires_at < NOW()");
+    }
+    $conn->begin_transaction();
+    $cmd = $conn->prepare("SELECT id, action, vmname{$payloadSql} FROM vbox_commands WHERE hostname=? AND status='pending' ORDER BY id ASC LIMIT 1 FOR UPDATE");
+    $cmd->bind_param('s', $hostname);
+    $cmd->execute();
+    $row = $cmd->get_result()->fetch_assoc();
+    if ($row) {
+        $id = (int) $row['id'];
+        $leaseToken = bin2hex(random_bytes(24));
+        $leaseHash = hash('sha256', $leaseToken);
+        if (sync_column_exists('vbox_commands', 'lease_token_hash')) {
+            $update = $conn->prepare("UPDATE vbox_commands SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW(), lease_token_hash=?, lease_expires_at=DATE_ADD(NOW(), INTERVAL 5 MINUTE), attempts=attempts+1, progress_message='Claimed by host agent', progress_percent=5 WHERE id=? AND status='pending'");
+            $update->bind_param('si', $leaseHash, $id);
+        } else {
+            $update = $conn->prepare("UPDATE vbox_commands SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=? AND status='pending'");
+            $update->bind_param('i', $id);
+        }
+        $update->execute();
+    }
+    $conn->commit();
+} catch (Throwable $e) {
+    try { $conn->rollback(); } catch (Throwable $ignored) {}
+    $row = null;
+}
 
-if ($row = $result->fetch_assoc()) {
-    $id = (int) $row['id'];
-    $update = $conn->prepare("UPDATE vbox_commands SET status='running', started_at=COALESCE(started_at, NOW()), updated_at=NOW() WHERE id=?");
-    $update->bind_param('i', $id);
-    $update->execute();
-
+if ($row) {
     header('Content-Type: text/plain; charset=utf-8');
-    echo 'v2|' . $id . '|' . $row['action'] . '|' . base64_encode((string) $row['vmname']) . '|' . base64_encode((string) ($row['payload'] ?? ''));
+    echo 'v3|' . $id . '|' . $row['action'] . '|' . base64_encode((string) $row['vmname']) . '|' . base64_encode((string) ($row['payload'] ?? '')) . '|' . $leaseToken;
     exit;
 }
 

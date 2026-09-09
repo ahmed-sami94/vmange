@@ -2,8 +2,10 @@
 declare(strict_types=1);
 
 require_once __DIR__ . '/db.php';
+require_once __DIR__ . '/notifications.php';
+require_once __DIR__ . '/management.php';
 
-const VMANGE_LATEST_AGENT_VERSION = 'v1.6.2';
+const VMANGE_LATEST_AGENT_VERSION = 'v2.0.0';
 
 $config = app_config();
 secure_session_start();
@@ -12,7 +14,7 @@ header('X-Frame-Options: SAMEORIGIN');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: same-origin');
 header("Permissions-Policy: geolocation=(), microphone=(), camera=()");
-header("Content-Security-Policy: default-src 'self'; script-src 'self' https://cdn.jsdelivr.net; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'self'; form-action 'self'");
+header("Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'");
 header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
 header('Pragma: no-cache');
 header('Expires: 0');
@@ -40,6 +42,65 @@ function latest_agent_version(): string
         }
     }
     return VMANGE_LATEST_AGENT_VERSION;
+}
+
+function agent_release_catalog(): array
+{
+    $manifest = __DIR__ . '/assets/agent/version.json';
+    $data = is_file($manifest) ? json_decode((string) file_get_contents($manifest), true) : [];
+    $rows = is_array($data['releases'] ?? null) ? $data['releases'] : [];
+    $releases = [];
+    foreach ($rows as $row) {
+        if (!is_array($row)) {
+            continue;
+        }
+        $version = trim((string) ($row['version'] ?? ''));
+        $file = ltrim(str_replace('\\', '/', (string) ($row['file'] ?? '')), '/');
+        if (!preg_match('/^v\d+\.\d+\.\d+$/', $version)
+            || $file === ''
+            || str_contains($file, '..')
+            || !preg_match('#^[A-Za-z0-9._/-]+$#', $file)) {
+            continue;
+        }
+        $absolute = __DIR__ . '/assets/agent/' . $file;
+        if (!is_file($absolute)) {
+            continue;
+        }
+        $notes = is_array($row['notes'] ?? null)
+            ? array_values(array_filter(array_map('strval', $row['notes']), static fn(string $note): bool => trim($note) !== ''))
+            : [];
+        $releases[] = [
+            'version' => $version,
+            'file' => $file,
+            'released_at' => (string) ($row['released_at'] ?? ''),
+            'notes' => $notes,
+            'sha256' => hash_file('sha256', $absolute),
+            'latest' => $version === latest_agent_version(),
+        ];
+    }
+    return array_merge($releases, uploaded_release_catalog());
+}
+
+function resolved_agent_upgrade_payload(string $payload): string
+{
+    $requested = '';
+    if ($payload !== '') {
+        $data = json_decode($payload, true);
+        $requested = is_array($data) ? trim((string) ($data['version'] ?? '')) : '';
+    }
+    $requested = $requested !== '' ? $requested : latest_agent_version();
+    foreach (agent_release_catalog() as $release) {
+        if ($release['version'] !== $requested) {
+            continue;
+        }
+        return json_encode([
+            'version' => $release['version'],
+            'expected_version' => $release['version'],
+            'url' => $release['url'] ?? base_url('assets/agent/' . $release['file']),
+            'sha256' => $release['sha256'],
+        ], JSON_UNESCAPED_SLASHES);
+    }
+    throw new InvalidArgumentException('Requested agent release is not available');
 }
 
 function asset_url(string $path): string
@@ -202,7 +263,7 @@ function metric_history(string $hostname, array $fallback = []): array
     $swapSelect = column_exists('vbox_metrics', 'swap_used_mb') && column_exists('vbox_metrics', 'swap_total_mb')
         ? 'swap_used_mb, swap_total_mb'
         : '0 AS swap_used_mb, 0 AS swap_total_mb';
-    $stmt = db()->prepare("SELECT cpu_percent, load1, ram_used_mb, ram_total_mb, $swapSelect, rx_bytes, tx_bytes, created_at FROM vbox_metrics WHERE hostname=? ORDER BY id DESC LIMIT 80");
+    $stmt = db()->prepare("SELECT cpu_percent, load1, ram_used_mb, ram_total_mb, $swapSelect, rx_bytes, tx_bytes, created_at FROM vbox_metrics WHERE hostname=? AND created_at >= DATE_SUB(NOW(), INTERVAL 6 HOUR) ORDER BY id DESC LIMIT 1440");
     $stmt->bind_param('s', $hostname);
     $stmt->execute();
     $rows = [];
@@ -313,6 +374,7 @@ function validated_command_payload(string $action, string $payload): string
         'script_run' => ['script_id', 'body'],
         'terminal_exec' => ['command'],
         'host_wol_send' => ['target_host', 'mac', 'broadcast', 'port'],
+        'agent_upgrade' => ['version'],
     ];
     $vmIdentityActions = [
         'start', 'stop', 'poweroff', 'pause', 'resume', 'reset', 'restart', 'refresh_inventory',
@@ -487,7 +549,24 @@ function alarms_payload(): array
             $unread++;
         }
     }
-    return compact('rules', 'events', 'active', 'unread');
+    $deliveries = [];
+    if (table_exists('vbox_notification_deliveries')) {
+        $result = db()->query('SELECT id, alarm_event_id, channel, recipient, status, result, attempts, next_attempt_at, created_at, updated_at FROM vbox_notification_deliveries ORDER BY id DESC LIMIT 100');
+        while ($row = $result->fetch_assoc()) {
+            $deliveries[] = $row;
+        }
+    }
+    return [
+        'rules' => $rules,
+        'events' => $events,
+        'active' => $active,
+        'unread' => $unread,
+        'deliveries' => $deliveries,
+        'worker' => [
+            'last_run_at' => setting_value('monitor_last_run_at', ''),
+            'last_result' => decode_json_column(setting_value('monitor_last_result', '')),
+        ],
+    ];
 }
 
 function mail_settings_payload(): array
@@ -495,6 +574,7 @@ function mail_settings_payload(): array
     $cfg = app_config();
     return [
         'mail_from' => setting_value('mail_from', (string) $cfg['mail_from']),
+        'mail_transport' => setting_value('mail_transport', (string) $cfg['mail_transport']),
         'smtp_host' => setting_value('smtp_host', (string) $cfg['smtp_host']),
         'smtp_port' => setting_value('smtp_port', (string) $cfg['smtp_port']),
         'smtp_username' => setting_value('smtp_username', (string) $cfg['smtp_username']),
@@ -506,142 +586,80 @@ function mail_settings_payload(): array
     ];
 }
 
-function alarm_metric_value(array $host, string $metric): ?float
-{
-    $metrics = $host['metrics'] ?? [];
-    if ($metric === 'cpu') {
-        return (float) ($metrics['cpu'] ?? 0);
-    }
-    if ($metric === 'memory') {
-        return ($metrics['ram_total_mb'] ?? 0) > 0 ? (($metrics['ram_used_mb'] ?? 0) / max(1, $metrics['ram_total_mb'])) * 100 : 0.0;
-    }
-    if ($metric === 'disk') {
-        return ($metrics['disk_total_mb'] ?? 0) > 0 ? (($metrics['disk_used_mb'] ?? 0) / max(1, $metrics['disk_total_mb'])) * 100 : 0.0;
-    }
-    if ($metric === 'offline') {
-        return empty($host['online']) ? 1.0 : 0.0;
-    }
-    return null;
-}
-
-function alarm_matches(float $value, string $operator, float $threshold): bool
-{
-    return match ($operator) {
-        '>' => $value > $threshold,
-        '<' => $value < $threshold,
-        '<=' => $value <= $threshold,
-        '=' => $value === $threshold,
-        default => $value >= $threshold,
-    };
-}
-
-function smtp_send_message(string $to, string $subject, string $body): array
+function imap_connection_test(): array
 {
     $cfg = app_config();
-    $host = setting_value('smtp_host', (string) $cfg['smtp_host']);
-    $port = (int) setting_value('smtp_port', (string) $cfg['smtp_port']);
-    $user = setting_value('smtp_username', (string) $cfg['smtp_username']);
-    $pass = setting_value('smtp_password', (string) $cfg['smtp_password']);
-    $from = setting_value('mail_from', (string) $cfg['mail_from']);
-    $encryption = strtolower((string) setting_value('smtp_encryption', (string) $cfg['smtp_encryption']));
-    if ($host === '' || $from === '') {
-        return [false, 'SMTP host and from address are required'];
+    $host = setting_value('imap_host', (string) $cfg['imap_host']);
+    $port = (int) setting_value('imap_port', (string) $cfg['imap_port']);
+    $user = setting_value('imap_username', (string) $cfg['imap_username']);
+    $pass = setting_value('imap_password', (string) $cfg['imap_password']);
+    $encryption = strtolower(setting_value('imap_encryption', (string) $cfg['imap_encryption']));
+    if (!in_array($encryption, ['tls','ssl'], true) || !preg_match('/^[A-Za-z0-9.-]+$/D', $host) || $port<1 || $port>65535 || preg_match('/[\r\n\x00]/', $user . $pass)) {
+        return [false, 'IMAP requires a valid server, verified TLS and credentials without control characters'];
+    }
+    if ($host === '') {
+        return [false, 'IMAP host is required'];
     }
     $remote = ($encryption === 'ssl' ? 'ssl://' : '') . $host . ':' . $port;
-    $socket = @stream_socket_client($remote, $errno, $errstr, 10);
+    $context = stream_context_create(['ssl'=>['verify_peer'=>true,'verify_peer_name'=>true,'allow_self_signed'=>false,'peer_name'=>$host]]);
+    $socket = @stream_socket_client($remote, $errno, $errstr, 10, STREAM_CLIENT_CONNECT, $context);
     if (!$socket) {
-        return [false, 'SMTP connect failed: ' . $errstr];
+        return [false, 'IMAP connect failed: ' . $errstr];
     }
     stream_set_timeout($socket, 10);
-    $read = static function () use ($socket): string {
-        return (string) fgets($socket, 1024);
-    };
-    $write = static function (string $line) use ($socket): void {
-        fwrite($socket, $line . "\r\n");
-    };
-    $read();
-    $write('EHLO vmange.local');
-    $read();
+    $greeting = trim((string) fgets($socket, 2048));
     if ($encryption === 'tls') {
-        $write('STARTTLS');
-        $read();
-        if (!stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
+        fwrite($socket, "a1 STARTTLS\r\n");
+        $response = trim((string) fgets($socket, 2048));
+        if (!str_starts_with(strtoupper($response), 'A1 OK')
+            || !stream_socket_enable_crypto($socket, true, STREAM_CRYPTO_METHOD_TLS_CLIENT)) {
             fclose($socket);
-            return [false, 'SMTP STARTTLS failed'];
+            return [false, 'IMAP STARTTLS failed: ' . $response];
         }
-        $write('EHLO vmange.local');
-        $read();
     }
     if ($user !== '' && $pass !== '') {
-        $write('AUTH LOGIN');
-        $read();
-        $write(base64_encode($user));
-        $read();
-        $write(base64_encode($pass));
-        $auth = $read();
-        if (!str_starts_with($auth, '235')) {
+        $safeUser = addcslashes($user, "\\\"");
+        $safePass = addcslashes($pass, "\\\"");
+        fwrite($socket, "a2 LOGIN \"{$safeUser}\" \"{$safePass}\"\r\n");
+        $response = '';
+        while (($line = fgets($socket, 2048)) !== false) {
+            $response .= $line;
+            if (strlen($response)>16384) { fclose($socket); return [false, 'IMAP response exceeds limit']; }
+            if (str_starts_with(strtoupper($line), 'A2 ')) {
+                break;
+            }
+        }
+        if (!str_contains(strtoupper($response), 'A2 OK')) {
             fclose($socket);
-            return [false, 'SMTP authentication failed'];
+            return [false, 'IMAP authentication failed'];
         }
     }
-    $write('MAIL FROM:<' . $from . '>');
-    $read();
-    $write('RCPT TO:<' . $to . '>');
-    $read();
-    $write('DATA');
-    $read();
-    fwrite($socket, "Subject: {$subject}\r\nFrom: {$from}\r\nTo: {$to}\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n{$body}\r\n.\r\n");
-    $result = $read();
-    $write('QUIT');
+    fwrite($socket, "a9 LOGOUT\r\n");
     fclose($socket);
-    return [str_starts_with($result, '250'), trim($result)];
+    return [true, $user !== '' && $pass !== '' ? 'IMAP connection and authentication succeeded' : 'IMAP server connection succeeded; credentials are not configured'];
 }
 
-function evaluate_alarm_rules(array $hosts): void
+function server_diagnostics_payload(): array
 {
-    if (!table_exists('vbox_alarm_rules') || !table_exists('vbox_alarm_events')) {
-        return;
+    if (current_user_role() !== 'admin') {
+        return [];
     }
-    $rules = [];
-    $result = db()->query('SELECT * FROM vbox_alarm_rules WHERE enabled=1');
-    while ($row = $result->fetch_assoc()) {
-        $rules[] = $row;
+    $path = __DIR__ . '/error_log';
+    $size = is_file($path) ? (int) filesize($path) : 0;
+    $tail = '';
+    if ($size > 0 && ($handle = @fopen($path, 'rb'))) {
+        $bytes = min($size, 32768);
+        fseek($handle, -$bytes, SEEK_END);
+        $tail = (string) fread($handle, $bytes);
+        fclose($handle);
     }
-    foreach ($rules as $rule) {
-        foreach ($hosts as $host) {
-            $value = alarm_metric_value($host, (string) $rule['metric']);
-            if ($value === null) {
-                continue;
-            }
-            $matched = alarm_matches($value, (string) $rule['operator'], (float) $rule['threshold']);
-            $stmt = db()->prepare("SELECT id, status FROM vbox_alarm_events WHERE rule_id=? AND hostname=? AND status IN ('active','acknowledged') ORDER BY id DESC LIMIT 1");
-            $stmt->bind_param('is', $rule['id'], $host['hostname']);
-            $stmt->execute();
-            $existing = $stmt->get_result()->fetch_assoc();
-            if ($matched && !$existing) {
-                $message = sprintf('%s on %s is %.2f (%s %.2f)', $rule['metric'], $host['hostname'], $value, $rule['operator'], $rule['threshold']);
-                $stmt = db()->prepare('INSERT INTO vbox_alarm_events(rule_id, hostname, metric_value, message) VALUES (?, ?, ?, ?)');
-                $stmt->bind_param('isds', $rule['id'], $host['hostname'], $value, $message);
-                $stmt->execute();
-                $eventId = (int) db()->insert_id;
-                $recipient = trim((string) ($rule['notify_email'] ?? ''));
-                if ($recipient !== '') {
-                    [$sent, $result] = smtp_send_message($recipient, 'VMange alarm: ' . $rule['name'], $message);
-                    $status = $sent ? 'sent' : 'failed';
-                    $stmt = db()->prepare('INSERT INTO vbox_notification_deliveries(alarm_event_id, channel, recipient, status, result) VALUES (?, "email", ?, ?, ?)');
-                    $stmt->bind_param('isss', $eventId, $recipient, $status, $result);
-                    $stmt->execute();
-                    $stmt = db()->prepare('UPDATE vbox_alarm_events SET last_notified_at=NOW() WHERE id=?');
-                    $stmt->bind_param('i', $eventId);
-                    $stmt->execute();
-                }
-            } elseif (!$matched && $existing) {
-                $stmt = db()->prepare("UPDATE vbox_alarm_events SET status='resolved', resolved_at=NOW() WHERE id=?");
-                $stmt->bind_param('i', $existing['id']);
-                $stmt->execute();
-            }
-        }
-    }
+    $lines = preg_split('/\R/', $tail) ?: [];
+    $lines = array_values(array_filter(array_map('trim', $lines), static fn(string $line): bool => $line !== ''));
+    return [
+        'php_version' => PHP_VERSION,
+        'error_log_bytes' => $size,
+        'error_log_tail' => array_slice($lines, -30),
+    ];
 }
 
 function is_vm_command_action(string $action): bool
@@ -713,6 +731,8 @@ function docs_payload(): array
         'wol-host-tools' => 'WOL And Host Tools',
         'audit-logs' => 'Audit And Logs',
         'alarms-notifications' => 'Alarms And Notifications',
+        'monitoring-retention' => 'Monitoring And Retention',
+        'command-lifecycle' => 'Command Lifecycle',
         'troubleshooting' => 'Troubleshooting',
         'security' => 'Security Model',
         'about' => 'About',
@@ -738,6 +758,9 @@ function queue_command(string $hostname, string $resourceAction, string $target,
         throw new InvalidArgumentException('Confirmation required');
     }
     $payload = validated_command_payload($resourceAction, substr($payload, 0, 65535));
+    if ($resourceAction === 'agent_upgrade') {
+        $payload = resolved_agent_upgrade_payload($payload);
+    }
     command_preflight($hostname, $resourceAction, $target, $payload);
     expire_stale_commands($hostname, max(60, (int) app_config()['online_window_seconds']));
     if (column_exists('vbox_commands', 'updated_at')) {
@@ -760,8 +783,9 @@ function queue_command(string $hostname, string $resourceAction, string $target,
         $stmt->bind_param('ssss', $hostname, $resourceAction, $target, $status);
     }
     $stmt->execute();
+    $commandId = (int) db()->insert_id;
     audit_log('command_queued', $hostname . ':' . $target, $resourceAction);
-    return (int) db()->insert_id;
+    return $commandId;
 }
 
 function dashboard_payload(): array
@@ -970,6 +994,7 @@ function dashboard_payload(): array
 
         $hosts[] = [
             'hostname' => $hostname,
+            'host_uuid' => (string) ($host['host_uuid'] ?? ''),
             'last_seen' => $host['last_seen'],
             'online' => (bool) $online,
             'health' => $online ? ($hostAlert ? 'warning' : 'healthy') : 'offline',
@@ -990,12 +1015,13 @@ function dashboard_payload(): array
             'compose' => $compose,
             'images' => $images,
             'agent_debug' => $agentDebug,
+            'uptime_seconds' => (int) ($metrics['uptime_seconds'] ?? 0),
         ];
     }
 
     $commands = [];
     $commandColumns = ['id', 'hostname', 'action', 'vmname', 'status', 'created_at'];
-    foreach (['payload', 'requested_by', 'result', 'updated_at', 'started_at', 'finished_at', 'exit_code', 'stdout', 'stderr', 'diagnostics_json'] as $column) {
+    foreach (['payload', 'requested_by', 'result', 'updated_at', 'started_at', 'finished_at', 'exit_code', 'stdout', 'stderr', 'diagnostics_json', 'lease_expires_at', 'attempts', 'progress_message', 'progress_percent', 'error_code'] as $column) {
         $commandColumns[] = column_exists('vbox_commands', $column) ? $column : "NULL AS $column";
     }
     $cmdResult = db()->query('SELECT ' . implode(', ', $commandColumns) . ' FROM vbox_commands ORDER BY id DESC LIMIT 200');
@@ -1011,7 +1037,6 @@ function dashboard_payload(): array
         }
     }
 
-    evaluate_alarm_rules($hosts);
     $alarms = alarms_payload();
 
     return [
@@ -1026,11 +1051,13 @@ function dashboard_payload(): array
         'users' => users_payload(),
         'alarms' => $alarms,
         'mailSettings' => mail_settings_payload(),
+        'serverDiagnostics' => server_diagnostics_payload(),
         'csrf' => csrf_token(),
         'role' => current_user_role(),
         'canManage' => can_manage(),
         'baseUrl' => base_url(),
         'agentVersion' => latest_agent_version(),
+        'agentReleases' => agent_release_catalog(),
         'gatewayUrl' => (string) app_config()['gateway_url'],
         'terminalGatewayEnabled' => (bool) app_config()['terminal_gateway_enabled'],
         'terminalGatewayUrl' => (string) app_config()['terminal_gateway_url'],
@@ -1052,6 +1079,7 @@ function handle_ajax(): void
         json_response(['ok' => false, 'error' => 'Method not allowed'], 405);
     }
     verify_csrf();
+    if (str_starts_with((string)$action, 'management-')) management_action(substr($action, 11));
 
     if ($action === 'command') {
         if (!can_manage()) {
@@ -1072,19 +1100,29 @@ function handle_ajax(): void
         if (!in_array($resourceAction, allowed_actions(), true)) {
             json_response(['ok' => false, 'error' => 'Action is not allowed'], 422);
         }
-        if (current_user_role() !== 'admin' && in_array($resourceAction, ['vm_delete', 'agent_uninstall', 'host_reboot', 'host_wol_send'], true)) {
-            json_response(['ok' => false, 'error' => 'Admin role required for this action'], 403);
+        if (!role_allows_action(current_user_role(), $resourceAction)) {
+            json_response(['ok' => false, 'error' => ucfirst(action_required_role($resourceAction)) . ' role required for this action'], 403);
+        }
+        if ($resourceAction === 'terminal_exec' && empty(app_config()['terminal_enabled'])) {
+            json_response(['ok' => false, 'error' => 'Audited terminal commands are disabled in server configuration'], 403);
         }
         if (is_destructive_action($resourceAction) && ($_POST['confirm'] ?? '') !== 'true') {
             json_response(['ok' => false, 'error' => 'Confirmation required'], 409);
         }
 
         try {
-            queue_command($hostname, $resourceAction, $target, (string) ($_POST['payload'] ?? ''), ($_POST['confirm'] ?? '') === 'true');
+            if ($resourceAction === 'agent_upgrade') {
+                $requested = json_decode((string)($_POST['payload'] ?? '{}'),true,8,JSON_THROW_ON_ERROR);
+                $outcomes = management_rollout((string)($requested['version'] ?? latest_agent_version()),[$hostname]);
+                if (($outcomes[0]['status'] ?? '') !== 'queued') throw new InvalidArgumentException($outcomes[0]['message'] ?? 'Upgrade could not be queued');
+                $commandId = (int)$outcomes[0]['command_id'];
+            } else {
+                $commandId = queue_command($hostname, $resourceAction, $target, (string) ($_POST['payload'] ?? ''), ($_POST['confirm'] ?? '') === 'true');
+            }
         } catch (Throwable $e) {
             json_response(['ok' => false, 'error' => $e->getMessage()], 422);
         }
-        json_response(['ok' => true, 'message' => 'Action queued']);
+        json_response(['ok' => true, 'message' => 'Action queued', 'command_id' => $commandId]);
     }
 
     if ($action === 'wol-save') {
@@ -1271,7 +1309,8 @@ function handle_ajax(): void
                 $stmt->execute();
                 $queued++;
             } catch (Throwable $e) {
-                $failures[] = validate_target((string) $hostValue) . ': ' . $e->getMessage();
+                $displayHost = preg_replace('/[^A-Za-z0-9._-]/', '', (string) $hostValue) ?: 'unknown-host';
+                $failures[] = $displayHost . ': ' . $e->getMessage();
             }
         }
         json_response(['ok' => $queued > 0, 'message' => $queued . ' script run(s) queued', 'failures' => $failures, 'error' => $queued > 0 ? null : implode('; ', $failures)]);
@@ -1281,11 +1320,52 @@ function handle_ajax(): void
         if (current_user_role() !== 'admin') {
             json_response(['ok' => false, 'error' => 'Admin role required'], 403);
         }
-        foreach (['mail_from','smtp_host','smtp_port','smtp_username','smtp_password','smtp_encryption','imap_host','imap_port','imap_username','imap_password','imap_encryption'] as $key) {
+        $transport = strtolower(trim((string) ($_POST['mail_transport'] ?? 'auto')));
+        if (!in_array($transport, ['auto', 'smtp', 'php'], true)) {
+            json_response(['ok' => false, 'error' => 'Invalid mail transport'], 422);
+        }
+        $mailFrom = trim((string) ($_POST['mail_from'] ?? ''));
+        $smtpHost = trim((string) ($_POST['smtp_host'] ?? ''));
+        $imapHost = trim((string) ($_POST['imap_host'] ?? ''));
+        $smtpPort = filter_var($_POST['smtp_port'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 65535]]);
+        $imapPort = filter_var($_POST['imap_port'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 65535]]);
+        $validHost = static fn(string $host): bool => $host === '' || filter_var($host, FILTER_VALIDATE_IP) !== false || (bool) preg_match('/^(?=.{1,253}$)([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/', $host);
+        if (!filter_var($mailFrom, FILTER_VALIDATE_EMAIL) || !$validHost($smtpHost) || !$validHost($imapHost) || $smtpPort === false || $imapPort === false) {
+            json_response(['ok' => false, 'error' => 'Enter valid mail addresses, server names, and ports'], 422);
+        }
+        if ($transport === 'smtp' && $smtpHost === '') {
+            json_response(['ok' => false, 'error' => 'SMTP host is required for SMTP-only delivery'], 422);
+        }
+        $_POST['mail_transport'] = $transport;
+        foreach (['mail_from','mail_transport','smtp_host','smtp_port','smtp_username','smtp_encryption','imap_host','imap_port','imap_username','imap_encryption'] as $key) {
             save_setting($key, trim((string) ($_POST[$key] ?? '')));
+        }
+        foreach (['smtp_password', 'imap_password'] as $key) {
+            $value = (string) ($_POST[$key] ?? '');
+            if ($value !== '') {
+                save_secret_setting($key, $value);
+            }
         }
         audit_log('mail_settings_saved', 'mail', 'SMTP and IMAP settings updated');
         json_response(['ok' => true, 'message' => 'Mail settings saved']);
+    }
+
+    if ($action === 'mail-test') {
+        if (current_user_role() !== 'admin') {
+            json_response(['ok' => false, 'error' => 'Admin role required'], 403);
+        }
+        $type = strtolower(trim((string) ($_POST['type'] ?? 'smtp')));
+        if ($type === 'imap') {
+            [$success, $message] = imap_connection_test();
+        } else {
+            $recipient = trim((string) ($_POST['recipient'] ?? ''));
+            if (!filter_var($recipient, FILTER_VALIDATE_EMAIL)) {
+                json_response(['ok' => false, 'error' => 'Enter a valid test recipient'], 422);
+            }
+            [$success, $message] = vmange_send_mail($recipient, 'VMange mail test', 'VMange mail delivery is working.');
+        }
+        audit_log('mail_test', $type, $message);
+        json_response(['ok' => $success, 'message' => $message, 'error' => $success ? null : $message], $success ? 200 : 422);
     }
 
     if ($action === 'alarm-save') {
@@ -1357,15 +1437,10 @@ function handle_ajax(): void
         if (current_user_role() !== 'admin') {
             json_response(['ok' => false, 'error' => 'Admin role required'], 403);
         }
-        $sharedToken = (string) app_config()['legacy_agent_token'];
-        $canUseHostTokens = $sharedToken === '';
         try {
-            if ($canUseHostTokens) {
-                ensure_host_tokens_table();
-            }
+            ensure_host_tokens_table();
         } catch (Throwable $e) {
-            $canUseHostTokens = false;
-            error_log('VMange host token table unavailable, falling back to legacy token: ' . $e->getMessage());
+            json_response(['ok' => false, 'error' => 'Host credential storage is unavailable. Enrollment was not created.'], 503);
         }
 
         try {
@@ -1383,7 +1458,7 @@ function handle_ajax(): void
         $stmt->bind_param('s', $hostname);
         $stmt->execute();
 
-        if ($canUseHostTokens) {
+        {
             $stmt = $conn->prepare('UPDATE vbox_host_tokens SET active=0, rotated_at=NOW() WHERE hostname=?');
             $stmt->bind_param('s', $hostname);
             $stmt->execute();
@@ -1392,8 +1467,6 @@ function handle_ajax(): void
             $stmt->bind_param('ss', $hostname, $hash);
             $stmt->execute();
             $tokenMode = 'per-host';
-        } else {
-            $tokenMode = 'direct';
         }
 
         $installerUrl = base_url('host-install.php');
@@ -1488,6 +1561,13 @@ function handle_ajax(): void
         } catch (Throwable $e) {
             json_response(['ok' => false, 'error' => $e->getMessage()], 422);
         }
+        $stmt = db()->prepare('SELECT *, TIMESTAMPDIFF(SECOND, last_seen, NOW()) AS age_seconds FROM vbox_hosts WHERE hostname=? LIMIT 1');
+        $stmt->bind_param('s', $hostname);
+        $stmt->execute();
+        $host = $stmt->get_result()->fetch_assoc();
+        $agentRemoval = $host
+            ? 'The host is revoked immediately. Its agent will receive HTTP 410 on the next heartbeat and uninstall itself when the maintenance helper is available.'
+            : 'The host identity is revoked and cannot enroll again without a new token.';
         block_host($hostname);
 
         $stmt = db()->prepare('DELETE FROM vbox_commands WHERE hostname=?');
@@ -1510,8 +1590,8 @@ function handle_ajax(): void
         $stmt->bind_param('s', $hostname);
         $stmt->execute();
 
-        audit_log('host_deleted', $hostname, 'Host removed from dashboard');
-        json_response(['ok' => true, 'message' => 'Host deleted']);
+        audit_log('host_deleted', $hostname, 'Host removed from dashboard. ' . $agentRemoval);
+        json_response(['ok' => true, 'message' => 'Host deleted. ' . $agentRemoval]);
     }
 
     if ($action === 'install-script') {
@@ -1560,6 +1640,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['login_user'], $_POST[
                     $_SESSION['vbox_role'] = $roleRow['role'] ?? 'admin';
                 }
                 $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+                $_SESSION['vbox_identity_checked_at'] = time();
                 audit_log('login', $user['username'], 'Dashboard login');
                 header('Location: index.php');
                 exit;
@@ -1582,14 +1663,14 @@ $loggedIn = !empty($_SESSION['vbox_logged_in']);
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title><?= e($config['app_name']) ?> Dashboard</title>
     <link rel="stylesheet" href="<?= e(asset_url('assets/css/app.css')) ?>">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js" defer></script>
+    <script src="<?= e(asset_url('assets/js/chart.umd.min.js')) ?>" defer></script>
     <script src="<?= e(asset_url('assets/js/app.js')) ?>" defer></script>
 </head>
 <body class="<?= $loggedIn ? 'dashboard-body' : 'login-body' ?>">
 <?php if (!$loggedIn): ?>
     <main class="login-shell">
         <section class="login-panel">
-            <img src="<?= e(asset_url('assets/img/vmange-logo.png')) ?>" alt="VMange" class="login-logo">
+            <img src="<?= e(asset_url('assets/img/vmange-symbol.png')) ?>" alt="VMange" class="login-logo">
             <h1>Sign in to VMange</h1>
             <p class="muted">Secure VirtualBox, host, and container operations.</p>
             <?php if ($loginError): ?>
@@ -1620,25 +1701,34 @@ $loggedIn = !empty($_SESSION['vbox_logged_in']);
         'terminalGatewayEnabled' => (bool) app_config()['terminal_gateway_enabled'],
         'terminalGatewayUrl' => (string) app_config()['terminal_gateway_url'],
         'docsEnabled' => (bool) app_config()['docs_enabled'],
-        'logo' => asset_url('assets/img/vmange-logo.png'),
+        'logo' => asset_url('assets/img/vmange-symbol.png'),
     ], JSON_UNESCAPED_SLASHES) ?></script>
     <div class="app-shell">
         <aside class="sidebar" aria-label="Primary navigation">
             <div class="sidebar-head">
                 <a class="brand" href="#overview" aria-label="VMange overview">
-                    <img src="<?= e(asset_url('assets/img/vmange-logo.png')) ?>" alt="VMange">
+                    <img src="<?= e(asset_url('assets/img/vmange-symbol.png')) ?>" alt=""><strong>VMange</strong>
                 </a>
                 <button class="icon-btn sidebar-toggle" id="sidebar-toggle" type="button" aria-label="Collapse sidebar" title="Collapse sidebar">&lt;</button>
             </div>
             <nav>
+                <p class="nav-section">Monitoring</p>
                 <a href="#overview" data-nav="overview" class="active">Overview</a>
+                <a href="#alarms" data-nav="alarms">Alarms</a>
+                <a href="#audit" data-nav="audit">Audit</a>
+                <p class="nav-section">Resources</p>
                 <a href="#hosts" data-nav="hosts">Hosts</a>
                 <a href="#vms" data-nav="vms">Virtual Machines</a>
                 <a href="#containers" data-nav="containers">Containers</a>
+                <p class="nav-section">Automation</p>
                 <a href="#compose" data-nav="compose">Compose</a>
                 <a href="#scripts" data-nav="scripts">Scripts</a>
-                <a href="#audit" data-nav="audit">Audit</a>
-                <a href="#alarms" data-nav="alarms">Alarms</a>
+                <p class="nav-section">Administration</p>
+                <a href="#agents" data-nav="agents">Agents</a>
+                <?php if (current_user_role() === 'admin'): ?>
+                <a href="admin.php#security">Security</a>
+                <a href="admin.php#backups">Configuration backups</a>
+                <?php endif; ?>
                 <a href="#settings" data-nav="settings">Settings</a>
                 <a href="docs.php">Docs</a>
                 <a href="#about" data-nav="about">About</a>
@@ -1655,6 +1745,7 @@ $loggedIn = !empty($_SESSION['vbox_logged_in']);
                     <button class="icon-btn mobile-nav-toggle" id="mobile-nav-toggle" type="button" aria-label="Open navigation" title="Open navigation">=</button>
                     <input id="global-search" type="search" placeholder="Search hosts, VMs, containers" aria-label="Search resources">
                     <a class="icon-btn alarm-link" href="#alarms" id="alarm-link" aria-label="Open alarms" title="Open alarms">!</a>
+                    <span class="sync-status" id="sync-status" role="status">Connecting</span>
                     <button class="icon-btn" id="help-button" type="button" aria-label="Open page help" title="Page help">?</button>
                     <button class="icon-btn" id="theme-toggle" type="button" aria-label="Toggle color theme">T</button>
                     <span class="user-pill"><?= e($_SESSION['vbox_user']) ?> / <?= e(current_user_role()) ?></span>

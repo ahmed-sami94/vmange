@@ -1,0 +1,17 @@
+.git
+.env
+.env.*
+config.php
+vbox-config.php
+storage/*
+!storage/.htaccess
+.runtime
+*.zip
+*.tar.gz
+*.bak
+*.dump
+*.log
+cookies*
+headers-*
+**/__pycache__
+**/*.pyc

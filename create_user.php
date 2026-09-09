@@ -18,6 +18,9 @@ if (!$isCli) {
         http_response_code(403);
         exit('Missing setup token.');
     }
+    if (empty($_SESSION['setup_csrf_token'])) {
+        $_SESSION['setup_csrf_token'] = bin2hex(random_bytes(32));
+    }
 }
 
 $username = $isCli ? ($argv[1] ?? 'admin') : trim((string) ($_POST['username'] ?? ''));
@@ -25,6 +28,13 @@ $password = $isCli ? ($argv[2] ?? '') : (string) ($_POST['password'] ?? '');
 $role = $isCli ? ($argv[3] ?? 'admin') : (string) ($_POST['role'] ?? 'admin');
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST' || $isCli) {
+    if (!$isCli && !hash_equals(
+        (string) ($_SESSION['setup_csrf_token'] ?? ''),
+        (string) ($_POST['csrf'] ?? '')
+    )) {
+        http_response_code(419);
+        exit('Invalid setup request token.');
+    }
     if (!in_array($role, ['admin', 'operator', 'viewer'], true)) {
         exit('Invalid role.');
     }
@@ -44,7 +54,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' || $isCli) {
         $stmt->bind_param('ss', $username, $hash);
     }
     $stmt->execute();
-    file_put_contents($lockFile, 'locked ' . gmdate('c'));
+    if (file_put_contents($lockFile, 'locked ' . gmdate('c'), LOCK_EX) === false) {
+        http_response_code(500);
+        exit('User created, but the installer could not be locked. Lock the installer before continuing.');
+    }
     audit_log('installer_user_created', $username, 'Installer locked after account creation');
     exit('User created and installer locked.');
 }
@@ -63,6 +76,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' || $isCli) {
             <img src="assets/img/vmange-logo.png" alt="VMange" class="login-logo">
             <h1>Create administrator</h1>
             <form method="post" class="login-form">
+                <input type="hidden" name="csrf" value="<?= e((string) ($_SESSION['setup_csrf_token'] ?? '')) ?>">
                 <label><span>Username</span><input name="username" required pattern="[A-Za-z0-9._-]{3,100}"></label>
                 <label><span>Password</span><input name="password" type="password" required minlength="14"></label>
                 <label><span>Role</span><select name="role"><option value="admin">Admin</option><option value="operator">Operator</option><option value="viewer">Viewer</option></select></label>

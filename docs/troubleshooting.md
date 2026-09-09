@@ -11,3 +11,5 @@ For host offline issues, check:
 For VM state issues, VMange prefers live `running_vm_names` and `running_vm_uuids` from the agent. If the dashboard is wrong, refresh inventory and inspect the latest operation diagnostics.
 
 For Docker inventory issues, confirm the agent run user can access Docker or is in the `docker` group.
+
+Metrics are intentionally retained for the latest six hours only. Older rows are pruned automatically during heartbeats.

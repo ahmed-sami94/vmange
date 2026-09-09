@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS `vbox_users` (
 
 CREATE TABLE IF NOT EXISTS `vbox_hosts` (
   `id` int(11) NOT NULL AUTO_INCREMENT,
+  `host_uuid` char(36) DEFAULT NULL,
   `hostname` varchar(100) NOT NULL,
   `all_vms` text DEFAULT NULL,
   `running_vms` text DEFAULT NULL,
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS `vbox_hosts` (
   `created_at` datetime DEFAULT current_timestamp(),
   PRIMARY KEY (`id`),
   UNIQUE KEY `hostname` (`hostname`),
+  KEY `host_uuid_idx` (`host_uuid`),
   KEY `last_seen` (`last_seen`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -52,10 +54,17 @@ CREATE TABLE IF NOT EXISTS `vbox_commands` (
   `stdout` mediumtext DEFAULT NULL,
   `stderr` mediumtext DEFAULT NULL,
   `diagnostics_json` longtext DEFAULT NULL,
+  `lease_token_hash` char(64) DEFAULT NULL,
+  `lease_expires_at` datetime DEFAULT NULL,
+  `attempts` int NOT NULL DEFAULT 0,
+  `progress_message` varchar(255) DEFAULT NULL,
+  `progress_percent` tinyint DEFAULT NULL,
+  `error_code` varchar(64) DEFAULT NULL,
   `created_at` datetime DEFAULT current_timestamp(),
   `updated_at` datetime DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `host_status` (`hostname`,`status`),
+  KEY `lease_idx` (`hostname`,`status`,`lease_expires_at`),
   KEY `created_at` (`created_at`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -203,9 +212,20 @@ CREATE TABLE IF NOT EXISTS `vbox_notification_deliveries` (
   `recipient` varchar(255) DEFAULT NULL,
   `status` varchar(32) NOT NULL DEFAULT 'pending',
   `result` text DEFAULT NULL,
+  `subject` varchar(255) DEFAULT NULL,
+  `body` text DEFAULT NULL,
+  `attempts` int NOT NULL DEFAULT 0,
+  `next_attempt_at` datetime DEFAULT NULL,
   `created_at` datetime DEFAULT current_timestamp(),
+  `updated_at` datetime DEFAULT NULL,
   PRIMARY KEY (`id`),
   KEY `alarm_event_id` (`alarm_event_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `vbox_schema_migrations` (
+  `version` varchar(64) NOT NULL,
+  `applied_at` datetime NOT NULL DEFAULT current_timestamp(),
+  PRIMARY KEY (`version`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 ALTER TABLE `vbox_users`

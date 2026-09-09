@@ -1,0 +1,15 @@
+DirectoryIndex index.php
+
+<IfModule mod_rewrite.c>
+    RewriteEngine Off
+</IfModule>
+
+<FilesMatch "^(config\.php|config\.example\.php|error_log|.*\.sql|.*\.log|.*\.env)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>

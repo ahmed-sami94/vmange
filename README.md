@@ -1,20 +1,47 @@
 # VMange
-<img width="1004" height="666" alt="vboxmange" src="https://github.com/user-attachments/assets/3b20de8e-457a-4ba8-8115-51ef85409859" />
+
+## VMange 2.0 Release Candidate
+
+This working tree contains the 2.0 implementation candidate. Production credential preflight, database integration tests and a Linux canary rollout are release gates, not completed deployment claims.
+
+- Teal/graphite identity and generated VM monogram, with light and dark themes.
+- Centralized per-host authentication across historical agent URLs.
+- Administrator Security, Installed Agents, Releases, Rollouts and Configuration views.
+- Immutable private agent uploads, checksummed installation and version acknowledgements.
+- Root-owned local maintenance socket, requiring a one-time v2 installer run.
+- Redacted JSON and Sodium-encrypted configuration portability with preview.
+- Authenticated technical handbook with full-text search and complete-book print view.
+
+Read [Agent Releases](docs/agent-releases.md), [Maintenance Service](docs/maintenance-socket.md), [Configuration Backups](docs/configuration-backups.md) and [Security](docs/security.md) before rollout. Apply the separate v1.9.2 authentication hotfix only after verifying existing host credentials. Never retain an authentication bypass to keep an old enrollment online.
 
 VMange is a free and open-source infrastructure management dashboard for Linux hosts, VirtualBox, Docker, Docker Compose, scripts, terminal workflows, monitoring, and alarms.
 
 It is designed around outbound host agents, so it can work from shared hosting, a WordPress subfolder, a public subfolder, a subdomain, a standalone PHP host, a Docker deployment, or a private local VM without requiring VMange to SSH directly into managed hosts.
 
-## Highlights
+## Reusing This Project
+
+This source distribution contains no configured accounts, managed hosts, database
+exports or runtime history. Start with your own empty database and follow
+[Deployment Notes](README_DEPLOYMENT.md) to create the first administrator.
+Docker users should copy `.env.example` to `.env` and fill its blank secrets before
+starting Compose. PHP hosting users can use the installer or `config.example.php`.
+
+Git, Docker and the package builder exclude private configuration and runtime
+storage. Keep backups separately; never upload a working deployment as a release.
+The 2.0 candidate still requires database integration and Linux rollout validation
+before production use.
+
+## Feature Highlights
 
 - Grafana-style host monitoring with CPU, load, RAM, swap, disk, network traffic, and time-series history
 - VirtualBox inventory and remote management for VM power actions, snapshots, storage, network, VRDE, screenshots, logs, cloning, exports, and VM creation
 - Docker container and image inventory with start, stop, restart, pause, unpause, kill, remove, logs, and image actions
 - Persistent Docker Compose stack management with save, edit, validate, deploy, start, stop, restart, pull, and delete workflows
-- Host enrollment with per-host tokens, agent upgrade/reinstall, capability detection, IP reporting, uptime, Wake-on-LAN, and host reboot controls
+- Host enrollment with per-host tokens, checksummed version upgrades/rollbacks, release notes, capability detection, IP reporting, uptime, Wake-on-LAN, and host reboot controls
 - Reusable scripts with per-host execution status and output history
 - Audited command terminal plus optional terminal gateway support for deployments that can host a live PTY service
 - Alarm policies for CPU, memory, disk, and offline hosts, with notification tracking and mail configuration
+- Scheduled alarm worker with six-hour metric retention, cPanel cron endpoint, Docker worker, email delivery, and signed generic webhooks
 - Security controls including login, CSRF protection, RBAC, allowlisted actions, prepared statements, audit logs, installer locking, token rotation, and confirmation gates for destructive actions
 
 ## Why VMange
@@ -38,7 +65,8 @@ The project favors practical operations, clear diagnostics, and deployment flexi
 - Per-host enrollment tokens and token rotation
 - Online/offline status, IP addresses, uptime, kernel, and agent version
 - Capability indicators for VirtualBox, Docker, and Compose
-- Agent restart, upgrade, reinstall, and uninstall workflows
+- Agent restart, versioned upgrade/rollback, reinstall, and uninstall workflows
+- Root-owned allowlisted maintenance helper for reliable install, reboot, restart, and uninstall actions
 - Install/repair actions for Docker and VirtualBox
 - Wake-on-LAN profiles and relay-host workflow
 - Safe reboot flow with confirmation
@@ -51,7 +79,7 @@ The project favors practical operations, clear diagnostics, and deployment flexi
 - Alarm rules for CPU, memory, disk, and offline hosts
 - Active alarm count in the dashboard header
 - Alarm acknowledgement and history
-- SMTP/IMAP configuration for notification workflows
+- SMTP/IMAP configuration, connection tests, and cPanel-friendly PHP mail fallback
 
 ### VirtualBox Management
 
@@ -94,6 +122,19 @@ The project favors practical operations, clear diagnostics, and deployment flexi
 - Installer lock support
 - No arbitrary dashboard shell execution except the explicit admin-only terminal workflow
 
+## Security And Reliability Release Notes
+
+The v1.9.1 release centralizes command authorization, removes the fallback agent token, stores new secrets only with a dedicated encryption key, serves chart code locally, and makes scheduled alarms use the configured mail transport with visible retries. VMange remains outbound-only: the dashboard never opens SSH and regular users cannot submit terminal or script actions.
+
+Run the local validation checks before publishing an archive:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\validate-agent-contract.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\validate-security.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\build-package.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\validate-package.ps1
+```
+
 ## Deployment Options
 
 VMange supports:
@@ -117,7 +158,7 @@ VMange includes authenticated in-app documentation pages. The current documentat
 | --- | --- |
 | Getting Started | First login, adding hosts, and the main dashboard areas |
 | Installation | Deployment modes, archive layout, installer usage, and shared-hosting notes |
-| Host Agent Installation | How the generated installer works and where agent files live |
+| Host Agent Installation | Installer paths, maintenance helper, version catalog, upgrades, and rollback |
 | Hosts | Host health, capabilities, maintenance tools, reboot, and Wake-on-LAN |
 | Virtual Machines | VM inventory, runtime state, detail panels, and common actions |
 | Containers And Compose | Docker inventory, saved stacks, validation, and collector behavior |
@@ -154,6 +195,8 @@ Important settings include:
 - HTTPS enforcement
 - optional gateway URLs
 - SMTP/IMAP settings
+
+Use a unique `VBOX_ENCRYPTION_KEY` of at least 32 characters. SMTP credentials cannot be saved without it. Keep `legacy_agent_token` empty after hosts have per-host enrollment tokens.
 
 See [README_DEPLOYMENT.md](README_DEPLOYMENT.md) for the full deployment matrix.
 

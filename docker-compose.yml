@@ -6,12 +6,16 @@ services:
     environment:
       VBOX_BASE_URL: "${VBOX_BASE_URL:-http://localhost:8080}"
       VBOX_FORCE_HTTPS: "${VBOX_FORCE_HTTPS:-0}"
+      VBOX_CRON_SECRET: "${VBOX_CRON_SECRET:?Set VBOX_CRON_SECRET in .env}"
+      VBOX_METRICS_RETENTION_HOURS: "${VBOX_METRICS_RETENTION_HOURS:-6}"
+      VBOX_ENCRYPTION_KEY: "${VBOX_ENCRYPTION_KEY:?Set VBOX_ENCRYPTION_KEY in .env}"
+      VBOX_WEBHOOK_URL: "${VBOX_WEBHOOK_URL:-}"
+      VBOX_WEBHOOK_SECRET: "${VBOX_WEBHOOK_SECRET:-}"
       VBOX_DB_HOST: db
       VBOX_DB_NAME: "${VBOX_DB_NAME:-vmange}"
       VBOX_DB_USER: "${VBOX_DB_USER:-vmange}"
-      VBOX_DB_PASS: "${VBOX_DB_PASS:-change-me}"
-      VBOX_AGENT_TOKEN: "${VBOX_AGENT_TOKEN:-change-me}"
-      VBOX_SETUP_TOKEN: "${VBOX_SETUP_TOKEN:-change-me-too}"
+      VBOX_DB_PASS: "${VBOX_DB_PASS:?Set VBOX_DB_PASS in .env}"
+      VBOX_SETUP_TOKEN: "${VBOX_SETUP_TOKEN:?Set VBOX_SETUP_TOKEN in .env}"
       VBOX_MAIL_FROM: "${VBOX_MAIL_FROM:-}"
       VBOX_SMTP_HOST: "${VBOX_SMTP_HOST:-}"
       VBOX_SMTP_PORT: "${VBOX_SMTP_PORT:-587}"
@@ -28,13 +32,31 @@ services:
     depends_on:
       - db
 
+  worker:
+    build: .
+    command: ["php", "/var/www/html/worker.php"]
+    restart: unless-stopped
+    environment:
+      VBOX_DB_HOST: db
+      VBOX_DB_NAME: "${VBOX_DB_NAME:-vmange}"
+      VBOX_DB_USER: "${VBOX_DB_USER:-vmange}"
+      VBOX_DB_PASS: "${VBOX_DB_PASS:?Set VBOX_DB_PASS in .env}"
+      VBOX_CRON_SECRET: "${VBOX_CRON_SECRET:?Set VBOX_CRON_SECRET in .env}"
+      VBOX_ENCRYPTION_KEY: "${VBOX_ENCRYPTION_KEY:?Set VBOX_ENCRYPTION_KEY in .env}"
+      VBOX_METRICS_RETENTION_HOURS: "${VBOX_METRICS_RETENTION_HOURS:-6}"
+      VBOX_MAIL_FROM: "${VBOX_MAIL_FROM:-}"
+      VBOX_WEBHOOK_URL: "${VBOX_WEBHOOK_URL:-}"
+      VBOX_WEBHOOK_SECRET: "${VBOX_WEBHOOK_SECRET:-}"
+    depends_on:
+      - db
+
   db:
     image: mariadb:11
     environment:
       MARIADB_DATABASE: "${VBOX_DB_NAME:-vmange}"
       MARIADB_USER: "${VBOX_DB_USER:-vmange}"
-      MARIADB_PASSWORD: "${VBOX_DB_PASS:-change-me}"
-      MARIADB_ROOT_PASSWORD: "${VBOX_DB_ROOT_PASS:-change-root}"
+      MARIADB_PASSWORD: "${VBOX_DB_PASS:?Set VBOX_DB_PASS in .env}"
+      MARIADB_ROOT_PASSWORD: "${VBOX_DB_ROOT_PASS:?Set VBOX_DB_ROOT_PASS in .env}"
     volumes:
       - vmange-db:/var/lib/mysql
       - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro

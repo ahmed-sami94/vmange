@@ -12,6 +12,7 @@ Hosts are Linux machines enrolled into VMange with one outbound agent each.
 - Restart agent restarts only the VMange service.
 - Reboot requires a second typed hostname confirmation.
 - Wake-on-LAN uses a saved MAC profile and an online relay host.
+- Delete host revokes access immediately and requests local agent self-removal on the next heartbeat.
 
 ## Capability actions
 If VirtualBox, Docker, or Compose is already detected, VMange shows an installed state. Missing capabilities expose repair or install actions instead.

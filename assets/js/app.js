@@ -12,6 +12,9 @@
     sidebarCollapsed: localStorage.getItem('vmange-sidebar') === 'collapsed',
     expandedVmKey: '',
     liveHistory: new Map(),
+    lastSyncAt: null,
+    syncError: '',
+    pageSearchTimer: null,
   };
 
   const root = document.getElementById('view-root');
@@ -25,12 +28,12 @@
   const helpButton = document.getElementById('help-button');
 
   const palette = {
-    blue: '#0b89e8',
+    blue: '#4b9ade',
     green: '#25a85a',
     amber: '#ffb020',
     orange: '#ff7a1a',
     red: '#e83e24',
-    teal: '#00a99d',
+    teal: '#20b8a5',
   };
 
   const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({
@@ -213,12 +216,15 @@
   }
 
   async function fetchDashboard(showLoading = false) {
-    if (showLoading) root.innerHTML = '<div class="loading-panel">Loading dashboard...</div>';
+    if (showLoading && !state.data) root.innerHTML = '<div class="loading-panel">Loading dashboard...</div>';
     const response = await fetch('index.php?ajax=dashboard', { headers: { Accept: 'application/json' } });
+    if (!response.ok) throw new Error(`Dashboard request failed with HTTP ${response.status}`);
     const payload = await response.json();
     if (!payload.ok) throw new Error(payload.error || 'Unable to load dashboard');
     recordLiveHistory(payload);
     state.data = payload;
+    state.lastSyncAt = new Date();
+    state.syncError = '';
     Object.assign(config, {
       csrf: payload.csrf,
       gatewayUrl: payload.gatewayUrl || config.gatewayUrl || '',
@@ -233,7 +239,22 @@
       alarmLink.classList.toggle('has-alerts', unread > 0);
       alarmLink.title = unread > 0 ? `${unread} active alarm${unread === 1 ? '' : 's'}` : 'Open alarms';
     }
-    render();
+    updateSyncStatus();
+    const activeElement = document.activeElement;
+    const editing = activeElement && ['INPUT', 'TEXTAREA', 'SELECT'].includes(activeElement.tagName);
+    if (!editing || showLoading) render();
+  }
+
+  function updateSyncStatus() {
+    const syncStatus = document.getElementById('sync-status');
+    if (!syncStatus) return;
+    syncStatus.classList.toggle('error', Boolean(state.syncError));
+    syncStatus.textContent = state.syncError
+      ? 'Sync issue'
+      : state.lastSyncAt
+        ? `Updated ${state.lastSyncAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`
+        : 'Connecting';
+    syncStatus.title = state.syncError || 'Dashboard data is current';
   }
 
   function postAction(endpoint, body) {
@@ -253,6 +274,15 @@
   }
 
   async function queueCommand(hostname, actionName, target, payload = '') {
+    const host = (state.data?.hosts || []).find((item) => item.hostname === hostname);
+    if (!host) {
+      toast(`Host ${hostname || 'unknown'} is no longer available. Refresh the dashboard and try again.`, 'error');
+      return false;
+    }
+    if (!host.online) {
+      toast(`Host ${hostname} is offline. Last heartbeat is required before ${actionName.replaceAll('_', ' ')} can run.`, 'error');
+      return false;
+    }
     const dangerous = [
       'poweroff', 'reset', 'snapshot_restore', 'snapshot_delete', 'vm_delete',
       'vm_set_resources', 'vm_set_boot_order', 'vm_set_description', 'vm_set_autostart',
@@ -260,18 +290,18 @@
       'vm_set_network', 'vm_cable_connected', 'vm_export', 'vm_import',
       'vm_create', 'vm_disable_vrde',
       'container_kill', 'container_remove', 'image_remove', 'compose_down', 'compose_deploy', 'dockerfile_deploy',
-      'host_install_virtualbox', 'host_install_docker', 'agent_restart', 'host_reboot', 'script_run', 'terminal_exec', 'agent_uninstall',
+      'host_install_virtualbox', 'host_repair_virtualbox', 'host_install_docker', 'agent_restart', 'host_reboot', 'script_run', 'terminal_exec', 'agent_uninstall',
     ].includes(actionName);
     let confirmed = false;
     if (dangerous) {
       confirmed = await confirmDanger(`Queue ${actionName.replaceAll('_', ' ')} for ${target} on ${hostname}?`);
-      if (!confirmed) return;
+      if (!confirmed) return false;
     }
     if (actionName === 'host_reboot') {
       const typed = window.prompt(`Type ${hostname} to confirm reboot`);
       if (typed !== hostname) {
         toast('Hostname confirmation did not match. Reboot was not queued.', 'error');
-        return;
+        return false;
       }
     }
 
@@ -284,7 +314,7 @@
     });
     if (!result.ok) {
       toast(result.error || 'Action failed', 'error');
-      return;
+      return false;
     }
     const message = actionName === 'agent_upgrade'
       ? 'Agent upgrade queued. The host will install it on the next heartbeat.'
@@ -303,6 +333,8 @@
       }
     }
     await fetchDashboard();
+    void watchCommand(result.command_id, actionName, target);
+    return true;
   }
 
   function wireDialogDismiss(dialog, { backdrop = true } = {}) {
@@ -322,10 +354,28 @@
   function commandStatusMessage(row) {
     const status = String(row?.status || '').toLowerCase();
     const exitCode = row?.exit_code !== null && row?.exit_code !== undefined && row?.exit_code !== '' ? `Exit ${row.exit_code}. ` : '';
-    const diagnostics = typeof row?.diagnostics_json === 'string' && row.diagnostics_json.trim() !== '' ? row.diagnostics_json : '';
+    let diagnostics = '';
+    if (typeof row?.diagnostics_json === 'string' && row.diagnostics_json.trim() !== '') {
+      try {
+        const parsed = JSON.parse(row.diagnostics_json);
+        diagnostics = [
+          parsed.action ? `action=${parsed.action}` : '',
+          parsed.target ? `target=${parsed.target}` : '',
+          parsed.run_user ? `user=${parsed.run_user}` : '',
+          parsed.home ? `HOME=${parsed.home}` : '',
+          parsed.vboxmanage_bin ? `VBoxManage=${parsed.vboxmanage_bin}` : '',
+        ].filter(Boolean).join(', ');
+      } catch {
+        diagnostics = row.diagnostics_json;
+      }
+    }
     if (status === 'done') return row.result || row.stdout || `${exitCode}Action completed successfully.`;
-    if (status === 'failed') return `${exitCode}${row.stderr || row.result || row.stdout || diagnostics || 'Action failed. No extra output was returned.'}`;
-    if (status === 'running') return 'The agent has claimed this action and is still working on it.';
+    if (status === 'failed') {
+      const reason = row.stderr || row.result || row.stdout || 'Action failed. No output was returned by the host.';
+      const code = row.error_code ? `code=${row.error_code}. ` : '';
+      return `${code}${exitCode}${reason}${diagnostics ? ` (${diagnostics})` : ''}`;
+    }
+    if (status === 'running') return row.progress_message || 'The agent has claimed this action and is still working on it.';
     if (status === 'pending') return 'Queued and waiting for the next host heartbeat.';
     if (status === 'sent') return 'Sent to the agent and waiting for completion.';
     if (status === 'expired') return 'The action aged out before a final result was received.';
@@ -335,7 +385,31 @@
   function statusBadge(status, message = '') {
     const cleanStatus = String(status || 'unknown');
     const detail = message || cleanStatus;
-    return `<span class="badge status-help ${esc(cleanStatus)}" tabindex="0" title="${esc(detail)}" data-status-detail="${esc(detail)}">${esc(cleanStatus)}<button class="status-info" type="button" aria-label="Status detail" title="${esc(detail)}" data-status-detail="${esc(detail)}">i</button></span>`;
+    return `<button class="badge status-help ${esc(cleanStatus)}" type="button" title="${esc(detail)}" data-status-detail="${esc(detail)}">${esc(cleanStatus)}<span class="status-info" aria-hidden="true">i</span></button>`;
+  }
+
+  async function watchCommand(commandId, actionName, target) {
+    if (!commandId) return;
+    for (let attempt = 0; attempt < 36; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 2500));
+      try {
+        const response = await fetch('index.php?ajax=dashboard', { headers: { Accept: 'application/json' } });
+        const payload = await response.json();
+        if (!payload.ok) continue;
+        const command = (payload.commands || []).find((row) => Number(row.id) === Number(commandId));
+        if (!command || !['done', 'failed', 'expired'].includes(String(command.status).toLowerCase())) continue;
+        await fetchDashboard();
+        const detail = commandStatusMessage(command);
+        toast(
+          `${actionName.replaceAll('_', ' ')} ${command.status} for ${target}: ${detail.slice(0, 220)}`,
+          command.status === 'done' ? 'success' : 'error',
+        );
+        return;
+      } catch {
+        continue;
+      }
+    }
+    toast(`${actionName.replaceAll('_', ' ')} is still running. Check Audit for progress.`, 'info');
   }
 
   function metricPoint(host, label = '') {
@@ -393,11 +467,12 @@
     return `<article class="metric-card"><span>${esc(label)}</span><strong>${esc(value)}</strong><span>${esc(hint)}</span></article>`;
   }
 
-  function gauge(label, value, color = palette.blue) {
+  function gauge(label, value) {
     const clean = Math.max(0, Math.min(100, Math.round(Number(value || 0))));
     return `
-      <div>
-        <div class="gauge" style="--value:${clean};--gauge-color:${color}"><strong>${clean}%</strong></div>
+      <div class="gauge-stat">
+        <strong>${clean}%</strong>
+        <progress class="resource-progress" max="100" value="${clean}" aria-label="${esc(label)} ${clean}%"></progress>
         <div class="gauge-label">${esc(label)}</div>
       </div>`;
   }
@@ -406,7 +481,7 @@
     const value = pct(used, total);
     return `
       <div>
-        <div class="meter"><span style="--value:${value}"></span></div>
+        <progress class="resource-progress" max="100" value="${value}" aria-label="${esc(label)} ${value}%"></progress>
         <div class="meter-label">${esc(label)} / ${mem(used)} / ${mem(total)}</div>
       </div>`;
   }
@@ -521,7 +596,7 @@
     const primaryButton = buttonHtml(host.hostname, vm.name, primary[0], primary[1], primary[2], identity);
     return `<div class="vm-action-row">
       ${primaryButton}
-      <button class="btn ghost" data-vm-expand="${esc(vm.name)}" data-host="${esc(host.hostname)}">${state.expandedVmKey === `${host.hostname}:${vm.name}` ? 'Hide details' : 'Details'}</button>
+      <button class="btn ghost" data-vm-expand="${esc(vm.name)}" data-host="${esc(host.hostname)}" aria-expanded="${state.expandedVmKey === `${host.hostname}:${vm.name}` ? 'true' : 'false'}">${state.expandedVmKey === `${host.hostname}:${vm.name}` ? 'Hide details' : 'Details'}</button>
     </div>`;
   }
 
@@ -883,7 +958,9 @@ COPY . /usr/share/nginx/html
     ));
     const caps = host.capabilities || {};
     const virtualBoxControl = caps.has_virtualbox
-      ? '<span class="badge online">VirtualBox installed</span>'
+      ? `<span class="badge online">VirtualBox installed</span>${caps.vbox_device_access === false
+        ? `<button class="btn warn" type="button" data-command="host_repair_virtualbox" data-host="${esc(host.hostname)}" data-target="virtualbox-access">Repair VirtualBox access</button>`
+        : '<span class="badge online">Device access ready</span>'}`
       : `<button class="btn ghost" type="button" data-command="host_install_virtualbox" data-host="${esc(host.hostname)}" data-target="virtualbox">Install/repair VirtualBox</button>`;
     const dockerControl = caps.has_docker
       ? '<span class="badge online">Docker installed</span>'
@@ -891,6 +968,9 @@ COPY . /usr/share/nginx/html
     const composeControl = caps.has_compose
       ? '<span class="badge online">Compose installed</span>'
       : '<span class="badge pending">Compose missing</span>';
+    const maintenanceControl = caps.has_root_helper
+      ? '<span class="badge online">Maintenance helper ready</span>'
+      : '<span class="badge warn" title="Run the latest generated installer once to enable audited package install, reboot, and full uninstall actions.">Maintenance helper missing</span>';
     const hostTools = state.data.role === 'admin' ? `
       <section class="panel host-tools-panel">
         <div class="panel-head host-detail-actions">
@@ -903,6 +983,7 @@ COPY . /usr/share/nginx/html
             ${virtualBoxControl}
             ${dockerControl}
             ${composeControl}
+            ${maintenanceControl}
             <button class="btn warn" type="button" data-command="host_reboot" data-host="${esc(host.hostname)}" data-target="host">Reboot host</button>
             <button class="btn ghost" type="button" data-wol-open="${esc(host.hostname)}">Wake-on-LAN</button>
             <button class="btn primary" type="button" data-command="agent_upgrade" data-host="${esc(host.hostname)}" data-target="vmange-agent" ${agentCommandPending ? 'disabled' : ''}>${agentCommandPending ? 'Upgrade queued' : (agentNeedsUpgrade ? 'Upgrade agent' : 'Reinstall agent')}</button>
@@ -1152,14 +1233,74 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
       <section class="table-panel">
         <div class="table-head"><h2>Recent operations</h2><div class="actions">${withRefresh ? '<button class="icon-btn" type="button" data-page-refresh title="Refresh Operations" aria-label="Refresh Operations">&#8635;</button>' : ''}${withAuditLink ? '<a class="btn ghost" href="#audit">Full audit</a>' : ''}<span class="badge">${rows.length} / ${state.data.commands.length} events</span></div></div>
         <div class="table-wrap">
-          <table>
-            <thead><tr><th>Time</th><th>Host</th><th>Action</th><th>Target</th><th>Status</th></tr></thead>
+          <table class="responsive-table">
+            <thead><tr><th>Time</th><th>Host</th><th>Action</th><th>Target</th><th>Status</th><th>Details</th></tr></thead>
             <tbody>
-              ${rows.map((cmd) => `<tr><td>${esc(cmd.created_at)}</td><td>${esc(cmd.hostname)}</td><td>${esc(cmd.action)}</td><td>${esc(cmd.vmname)}</td><td>${statusBadge(cmd.status, commandStatusMessage(cmd))}</td></tr>`).join('') || tableEmpty(5)}
+              ${rows.map((cmd) => `<tr><td data-label="Time">${esc(cmd.created_at)}</td><td data-label="Host">${esc(cmd.hostname)}</td><td data-label="Action">${esc(cmd.action)}</td><td data-label="Target">${esc(cmd.vmname)}</td><td data-label="Status">${statusBadge(cmd.status, commandStatusMessage(cmd))}</td><td data-label="Details"><button class="btn ghost compact" type="button" data-command-detail="${esc(cmd.id)}">View</button></td></tr>`).join('') || tableEmpty(6)}
             </tbody>
           </table>
         </div>
       </section>`;
+  }
+
+  function renderAgents() {
+    if (state.data.role === 'admin') {
+      title.textContent = 'Agents';
+      root.innerHTML = '<section class="panel"><h2>Agent release management</h2><div class="actions"><a class="btn primary" href="admin.php#installed">Installed Agents</a><a class="btn ghost" href="admin.php#releases">Releases</a><a class="btn ghost" href="admin.php#rollouts">Rollouts</a></div></section>';
+      return;
+    }
+    title.textContent = 'Agents';
+    const releases = state.data.agentReleases || [];
+    const latest = state.data.agentVersion || config.agentVersion || '';
+    const hosts = filteredHosts();
+    root.innerHTML = `
+      <section class="table-panel">
+        <div class="table-head">
+          <div><h2>Host agents</h2><p class="muted">Install the latest collector or roll back to a preserved release.</p></div>
+          <div class="actions"><button class="icon-btn" type="button" data-page-refresh title="Refresh Agents" aria-label="Refresh Agents">&#8635;</button><span class="badge">${hosts.length} hosts</span></div>
+        </div>
+        <div class="table-wrap">
+          <table class="responsive-table">
+            <thead><tr><th>Host</th><th>Installed</th><th>Latest</th><th>Status</th><th>Release</th><th>Action</th></tr></thead>
+            <tbody>
+              ${hosts.map((host) => {
+                const installed = host.metrics?.agent_version || 'unknown';
+                const current = installed === latest;
+                return `<tr>
+                  <td data-label="Host">${esc(host.hostname)}</td>
+                  <td data-label="Installed">${esc(installed)}</td>
+                  <td data-label="Latest">${esc(latest || '-')}</td>
+                  <td data-label="Status"><span class="badge ${current ? 'online' : 'warn'}">${current ? 'Current' : 'Update available'}</span></td>
+                  <td data-label="Release"><select data-agent-release="${esc(host.hostname)}">${releases.map((release) => `<option value="${esc(release.version)}" ${release.version === latest ? 'selected' : ''}>${esc(release.version)}${release.latest ? ' (latest)' : ' (rollback)'}</option>`).join('')}</select></td>
+                  <td data-label="Action">${state.data.role === 'admin' ? `<button class="btn primary" type="button" data-agent-install="${esc(host.hostname)}">Install selected</button>` : '<span class="muted">Admin required</span>'}</td>
+                </tr>`;
+              }).join('') || tableEmpty(6)}
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section class="release-grid">
+        ${releases.map((release) => `
+          <article class="panel release-card">
+            <div class="panel-head"><h2>${esc(release.version)}</h2><span class="badge ${release.latest ? 'online' : 'pending'}">${release.latest ? 'Latest' : 'Rollback'}</span></div>
+            <p class="muted">Released ${esc(release.released_at || '-')}</p>
+            <ul>${(release.notes || []).map((note) => `<li>${esc(note)}</li>`).join('') || '<li>No release notes supplied.</li>'}</ul>
+            <p class="checksum" title="${esc(release.sha256 || '')}">SHA-256 ${esc(String(release.sha256 || '').slice(0, 18))}...</p>
+          </article>`).join('') || empty('No installable agent releases were found.')}
+      </section>`;
+    document.querySelectorAll('[data-agent-install]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        const hostname = button.dataset.agentInstall;
+        const select = document.querySelector(`[data-agent-release="${CSS.escape(hostname)}"]`);
+        const version = select?.value || latest;
+        if (version !== latest) {
+          const confirmed = await confirmDanger(`Roll back ${hostname} to agent ${version}? The saved host configuration will be preserved.`);
+          if (!confirmed) return;
+        }
+        await queueCommand(hostname, 'agent_upgrade', 'vmange-agent', JSON.stringify({ version }));
+      });
+    });
+    bindPageRefresh();
   }
 
   function renderAudit() {
@@ -1244,8 +1385,10 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
       </section>
       <section class="panel">
         <div class="panel-head"><h2>Mail configuration</h2><span class="badge">Alerts</span></div>
+        <p class="muted">Auto mode tries authenticated SMTP first and falls back to the local cPanel/PHP mail transport.</p>
         <div class="form-grid">
           <input id="mail-from" placeholder="From email" value="${esc(state.data.mailSettings?.mail_from || '')}">
+          <select id="mail-transport"><option value="auto" ${state.data.mailSettings?.mail_transport === 'auto' ? 'selected' : ''}>Auto: SMTP then PHP mail</option><option value="smtp" ${state.data.mailSettings?.mail_transport === 'smtp' ? 'selected' : ''}>SMTP only</option><option value="php" ${state.data.mailSettings?.mail_transport === 'php' ? 'selected' : ''}>Local PHP mail</option></select>
           <input id="smtp-host" placeholder="SMTP host" value="${esc(state.data.mailSettings?.smtp_host || '')}">
           <input id="smtp-port" placeholder="SMTP port" value="${esc(state.data.mailSettings?.smtp_port || '587')}">
           <input id="smtp-user" placeholder="SMTP username" value="${esc(state.data.mailSettings?.smtp_username || '')}">
@@ -1256,8 +1399,16 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
           <input id="imap-user" placeholder="IMAP username" value="${esc(state.data.mailSettings?.imap_username || '')}">
           <input id="imap-pass" type="password" placeholder="IMAP password">
           <select id="imap-encryption"><option value="ssl" ${state.data.mailSettings?.imap_encryption === 'ssl' ? 'selected' : ''}>SSL</option><option value="tls" ${state.data.mailSettings?.imap_encryption === 'tls' ? 'selected' : ''}>TLS</option><option value="">None</option></select>
+          <input id="mail-test-recipient" type="email" placeholder="Test recipient">
           <button class="btn primary" id="save-mail">Save mail settings</button>
+          <button class="btn ghost" id="test-smtp" type="button">Send test email</button>
+          <button class="btn ghost" id="test-imap" type="button">Test IMAP</button>
         </div>
+      </section>
+      <section class="panel">
+        <div class="panel-head"><h2>Server diagnostics</h2><span class="badge">PHP ${esc(state.data.serverDiagnostics?.php_version || '-')}</span></div>
+        <p class="muted">Application error log size: ${bytes(state.data.serverDiagnostics?.error_log_bytes || 0)}. Only the last 30 lines are read.</p>
+        <pre class="diagnostic-output">${esc((state.data.serverDiagnostics?.error_log_tail || []).join('\n') || 'No application PHP errors were found.')}</pre>
       </section>`;
     document.getElementById('rotate-token')?.addEventListener('click', async () => {
       const hostname = document.getElementById('token-host').value;
@@ -1289,6 +1440,7 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
     document.getElementById('save-mail')?.addEventListener('click', async () => {
       const result = await postAction('mail-save', {
         mail_from: document.getElementById('mail-from').value,
+        mail_transport: document.getElementById('mail-transport').value,
         smtp_host: document.getElementById('smtp-host').value,
         smtp_port: document.getElementById('smtp-port').value,
         smtp_username: document.getElementById('smtp-user').value,
@@ -1303,17 +1455,29 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
       if (!result.ok) return toast(result.error || 'Could not save mail settings', 'error');
       toast(result.message || 'Mail settings saved', 'success');
     });
+    document.getElementById('test-smtp')?.addEventListener('click', async () => {
+      const recipient = document.getElementById('mail-test-recipient').value.trim();
+      const result = await postAction('mail-test', { type: 'smtp', recipient });
+      toast(result.message || result.error || 'Mail test finished', result.ok ? 'success' : 'error');
+    });
+    document.getElementById('test-imap')?.addEventListener('click', async () => {
+      const result = await postAction('mail-test', { type: 'imap' });
+      toast(result.message || result.error || 'IMAP test finished', result.ok ? 'success' : 'error');
+    });
     bindAddHost();
   }
 
   function renderAlarms() {
     title.textContent = 'Alarms';
     const alarms = state.data.alarms || { rules: [], events: [], active: 0, unread: 0 };
+    const worker = alarms.worker || {};
+    const deliveries = alarms.deliveries || [];
     root.innerHTML = `
       <section class="metric-grid">
         ${card('Active alarms', alarms.active || 0, 'Currently firing')}
         ${card('Unread alarms', alarms.unread || 0, 'Need acknowledgement')}
         ${card('Rules', alarms.rules?.length || 0, 'Monitoring policies')}
+        ${card('Monitor worker', worker.last_run_at || 'Never', deliveries.length ? `${deliveries.length} recent deliveries` : 'No delivery attempts')}
       </section>
       <section class="editor-panel panel">
         <div class="panel-head"><h2>Alarm rule</h2><span class="badge">Admin only</span></div>
@@ -1338,6 +1502,12 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
         <div class="table-wrap"><table><thead><tr><th>Opened</th><th>Host</th><th>Rule</th><th>Value</th><th>Status</th><th>Action</th></tr></thead><tbody>
           ${(alarms.events || []).map((event) => `<tr><td>${esc(event.opened_at)}</td><td>${esc(event.hostname)}</td><td>${esc(event.rule_name || '-')}</td><td>${esc(event.metric_value)}</td><td>${statusBadge(event.status || 'active', event.message || '')}</td><td>${event.status === 'active' ? `<button class="btn ghost" data-ack-alarm="${esc(event.id)}">Acknowledge</button>` : '-'}</td></tr>`).join('') || tableEmpty(6)}
         </tbody></table></div>
+      </section>
+      <section class="table-panel">
+        <div class="table-head"><h2>Notification delivery</h2><div class="actions"><button class="icon-btn" type="button" data-page-refresh title="Refresh notifications" aria-label="Refresh notifications">&#8635;</button><span class="badge">${deliveries.length}</span></div></div>
+        <div class="table-wrap"><table class="responsive-table"><thead><tr><th>Time</th><th>Channel</th><th>Recipient</th><th>Status</th><th>Attempts</th><th>Next attempt</th></tr></thead><tbody>
+          ${deliveries.map((delivery) => `<tr><td data-label="Time">${esc(delivery.updated_at || delivery.created_at || '-')}</td><td data-label="Channel">${esc(delivery.channel)}</td><td data-label="Recipient">${esc(delivery.recipient || '-')}</td><td data-label="Status">${statusBadge(delivery.status, delivery.result || '')}</td><td data-label="Attempts">${esc(delivery.attempts || 0)}</td><td data-label="Next attempt">${esc(delivery.next_attempt_at || '-')}</td></tr>`).join('') || tableEmpty(6)}
+        </tbody></table></div>
       </section>`;
     document.getElementById('save-alarm-rule')?.addEventListener('click', async () => {
       const result = await postAction('alarm-save', {
@@ -1359,6 +1529,7 @@ ${esc(cmd.result || cmd.stdout || cmd.stderr || '')}</pre>
       toast(result.message || 'Alarm acknowledged', 'success');
       await fetchDashboard();
     }));
+    bindPageRefresh();
     bindStatusInfo();
   }
 
@@ -1447,6 +1618,7 @@ uptime
     if (view.name === 'host' || view.name === 'hosts') return 'hosts';
     if (view.name === 'vms') return 'virtual-machines';
     if (view.name === 'containers' || view.name === 'compose') return 'containers-compose';
+    if (view.name === 'agents') return 'agent-installation';
     if (view.name === 'scripts' || view.name === 'audit') return 'audit-logs';
     if (view.name === 'alarms') return 'alarms-notifications';
     if (view.name === 'settings') return 'security';
@@ -1474,7 +1646,7 @@ uptime
     title.textContent = 'About VMange';
     root.innerHTML = `
       <section class="panel about-panel">
-        <h2>VMange v1.7</h2>
+        <h2>VMange ${esc(state.data.agentVersion || '')}</h2>
         <p>VMange is a free and open-source infrastructure management dashboard for Linux hosts, VirtualBox, Docker, Compose stacks, scripts, terminal access, and monitoring alarms.</p>
         <div class="stats-grid">
           <div class="stat-card"><span>VirtualBox</span><strong>Power, snapshots, storage, network, VRDE, screenshots</strong></div>
@@ -1512,6 +1684,7 @@ uptime
     if (view.name === 'containers') return renderContainers();
     if (view.name === 'compose') return renderCompose();
     if (view.name === 'scripts') return renderScripts();
+    if (view.name === 'agents') return renderAgents();
     if (view.name === 'audit') return renderAudit();
     if (view.name === 'alarms') return renderAlarms();
     if (view.name === 'settings') return renderSettings();
@@ -1532,9 +1705,16 @@ uptime
   function bindPageSearch() {
     document.querySelectorAll('[data-page-search]').forEach((input) => {
       input.addEventListener('input', () => {
-        state.search = input.value;
-        if (search) search.value = input.value;
-        render();
+        const query = input.value;
+        clearTimeout(state.pageSearchTimer);
+        state.pageSearchTimer = setTimeout(() => {
+          state.search = query;
+          if (search) search.value = query;
+          render();
+          const replacement = document.querySelector('[data-page-search]');
+          replacement?.focus();
+          replacement?.setSelectionRange(query.length, query.length);
+        }, 120);
       });
     });
   }
@@ -2101,9 +2281,13 @@ xfreerdp /v:${esc(primaryIp)}:${esc(port)}</pre>
 
   function bindVmExtras() {
     document.querySelectorAll('[data-console-guide]').forEach((button) => {
+      if (button.dataset.vmangeBound === '1') return;
+      button.dataset.vmangeBound = '1';
       button.addEventListener('click', () => openConsoleGuide(button.dataset.host, button.dataset.consoleGuide));
     });
     document.querySelectorAll('[data-vm-expand]').forEach((button) => {
+      if (button.dataset.vmangeBound === '1') return;
+      button.dataset.vmangeBound = '1';
       button.addEventListener('click', () => {
         const key = `${button.dataset.host}:${button.dataset.vmExpand}`;
         state.expandedVmKey = state.expandedVmKey === key ? '' : key;
@@ -2114,34 +2298,73 @@ xfreerdp /v:${esc(primaryIp)}:${esc(port)}</pre>
 
   function bindStatusInfo() {
     document.querySelectorAll('[data-status-detail]').forEach((button) => {
+      if (button.dataset.vmangeBound === '1') return;
+      button.dataset.vmangeBound = '1';
       button.addEventListener('click', (event) => {
         event.stopPropagation();
         toast(button.dataset.statusDetail || 'No additional detail is available.', 'info');
+      });
+    });
+    document.querySelectorAll('[data-command-detail]').forEach((button) => {
+      if (button.dataset.vmangeBound === '1') return;
+      button.dataset.vmangeBound = '1';
+      button.addEventListener('click', () => {
+        const row = (state.data?.commands || []).find((item) => String(item.id) === String(button.dataset.commandDetail));
+        if (!row) return toast('Operation details are no longer available.', 'error');
+        infoDialog(`Operation #${row.id}`, `
+          <div class="command-detail-grid">
+            <dl>
+              <dt>Status</dt><dd>${esc(row.status || '-')}</dd>
+              <dt>Host</dt><dd>${esc(row.hostname || '-')}</dd>
+              <dt>Action</dt><dd>${esc(row.action || '-')}</dd>
+              <dt>Target</dt><dd>${esc(row.vmname || '-')}</dd>
+              <dt>Exit code</dt><dd>${esc(row.exit_code ?? '-')}</dd>
+              <dt>Started</dt><dd>${esc(row.started_at || '-')}</dd>
+              <dt>Finished</dt><dd>${esc(row.finished_at || '-')}</dd>
+            </dl>
+            <div><h3>Result</h3><pre>${esc(commandStatusMessage(row))}</pre></div>
+            <div><h3>Standard output</h3><pre>${esc(row.stdout || '-')}</pre></div>
+            <div><h3>Standard error</h3><pre>${esc(row.stderr || '-')}</pre></div>
+          </div>`);
       });
     });
   }
 
   function bindCommands() {
     document.querySelectorAll('[data-command]').forEach((button) => {
+      if (button.dataset.vmangeBound === '1') return;
+      button.dataset.vmangeBound = '1';
       button.addEventListener('click', async () => {
+        const originalLabel = button.textContent;
+        button.disabled = true;
+        button.setAttribute('aria-busy', 'true');
         let queueHost = button.dataset.host;
         let payload = button.dataset.payload || '';
-        if (payload) {
-          const modalPayload = await openActionModal(button);
-          if (modalPayload === null) return;
-          payload = modalPayload;
-        }
-        if (button.dataset.command === 'vm_create' && payload) {
-          try {
-            const parsed = JSON.parse(payload);
-            if (parsed && parsed.__host) {
-              queueHost = String(parsed.__host);
-              delete parsed.__host;
-              payload = JSON.stringify(parsed);
+        try {
+          if (payload) {
+            const modalPayload = await openActionModal(button);
+            if (modalPayload === null) return;
+            payload = modalPayload;
+          }
+          if (button.dataset.command === 'vm_create' && payload) {
+            try {
+              const parsed = JSON.parse(payload);
+              if (parsed && parsed.__host) {
+                queueHost = String(parsed.__host);
+                delete parsed.__host;
+                payload = JSON.stringify(parsed);
+              }
+            } catch {
             }
-          } catch {}
+          }
+          await queueCommand(queueHost, button.dataset.command, button.dataset.target, payload);
+        } finally {
+          if (button.isConnected) {
+            button.disabled = false;
+            button.removeAttribute('aria-busy');
+            button.textContent = originalLabel;
+          }
         }
-        queueCommand(queueHost, button.dataset.command, button.dataset.target, payload);
       });
     });
     bindVmExtras();
@@ -2280,5 +2503,8 @@ xfreerdp /v:${esc(primaryIp)}:${esc(port)}</pre>
     root.innerHTML = empty(error.message);
     toast(error.message, 'error');
   });
-  setInterval(() => fetchDashboard().catch(() => {}), 15000);
+  setInterval(() => fetchDashboard().catch((error) => {
+    state.syncError = error.message || 'Dashboard refresh failed';
+    updateSyncStatus();
+  }), 15000);
 })();

@@ -1,3 +1,69 @@
 {
-  "version": "v1.7.0"
+  "version": "v2.0.0",
+  "released_at": "2026-09-09",
+  "releases": [
+    {
+      "version": "v2.0.0",
+      "file": "vmange-agent.sh",
+      "released_at": "2026-09-09",
+      "notes": [
+        "Verified HTTPS and mandatory version/checksum verification for agent upgrades.",
+        "Private result retry spool and one polling instance per installation.",
+        "Allowlisted maintenance socket; rerun the v2 host installer once to provision the root-owned service.",
+        "Preserves configuration and the previous executable for recovery."
+      ]
+    },
+    {
+      "version": "v1.9.1",
+      "file": "releases/v1.9.1/vmange-agent.sh",
+      "released_at": "2026-09-08",
+      "notes": [
+        "Removes the insecure fallback agent token and refuses heartbeats without an enrolled host token.",
+        "Pairs with centralized dashboard authorization and hardened notification delivery.",
+        "Preserves existing per-host configuration during checksummed upgrades."
+      ]
+    },
+    {
+      "version": "v1.9.0",
+      "file": "releases/v1.9.0/vmange-agent.sh",
+      "released_at": "2026-07-25",
+      "notes": [
+        "Adds stable host identity reporting from machine-id for generic multi-host deployments.",
+        "Uses leased command delivery so two agent loops cannot execute the same action.",
+        "Returns lease-aware command results with refreshed inventory and stronger diagnostics."
+      ]
+    },
+    {
+      "version": "v1.8.1",
+      "file": "releases/v1.8.1/vmange-agent.sh",
+      "released_at": "2026-07-25",
+      "notes": [
+        "Retries a failed VirtualBox start once after two seconds to handle transient host startup failures.",
+        "Adds automatic VBox.log diagnostics to failed VM start audit records.",
+        "Detects and repairs Linux VirtualBox device permissions through the restricted maintenance helper.",
+        "Keeps VM actions idempotent and verifies the final runtime state before reporting success.",
+        "Fixes duplicate operation detail dialogs after dashboard refreshes."
+      ]
+    },
+    {
+      "version": "v1.8.0",
+      "file": "releases/v1.8.0/vmange-agent.sh",
+      "released_at": "2026-07-25",
+      "notes": [
+        "Verifies VM start, stop, pause, resume, reset, and restart results before reporting success.",
+        "Adds exact VM preflight, run-user, HOME, VBoxManage, exit-code, stdout, and stderr diagnostics.",
+        "Hardens Docker and VirtualBox install actions and refreshes service group membership.",
+        "Supports trusted, checksum-verified upgrades and rollbacks from the Agents page."
+      ]
+    },
+    {
+      "version": "v1.7.0",
+      "file": "releases/v1.7.0/vmange-agent.sh",
+      "released_at": "2026-05-18",
+      "notes": [
+        "Adds alarms, host WOL metadata, monitoring retention, and expanded host operations.",
+        "Preserved as a rollback release."
+      ]
+    }
+  ]
 }
