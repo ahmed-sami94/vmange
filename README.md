@@ -1,10 +1,25 @@
+<p align="center">
+  <img src="assets/img/vmange-symbol.png" alt="VMange logo" width="96">
+</p>
+
 # VMange
+
+![VMange: open-source infrastructure management for Linux, VirtualBox, Docker and monitoring](assets/img/vmange-banner.png)
+
+VMange is a free, open-source dashboard for managing Linux hosts, VirtualBox VMs,
+Docker containers and Compose stacks, with monitoring, alarms and audited host actions.
+
+Outbound host agents connect to your dashboard, allowing deployment on shared PHP
+hosting, a subfolder, a subdomain, Docker or a private VM without direct SSH access
+from the dashboard to managed hosts.
+
+[Installation](README_DEPLOYMENT.md) · [Host Agents](docs/agent-installation.md) · [Security](docs/security.md) · [License](LICENSE)
 
 ## VMange 2.0 Release Candidate
 
 This working tree contains the 2.0 implementation candidate. Production credential preflight, database integration tests and a Linux canary rollout are release gates, not completed deployment claims.
 
-- Teal/graphite identity and generated VM monogram, with light and dark themes.
+- Refreshed teal and graphite interface with light and dark themes.
 - Centralized per-host authentication across historical agent URLs.
 - Administrator Security, Installed Agents, Releases, Rollouts and Configuration views.
 - Immutable private agent uploads, checksummed installation and version acknowledgements.
@@ -13,10 +28,6 @@ This working tree contains the 2.0 implementation candidate. Production credenti
 - Authenticated technical handbook with full-text search and complete-book print view.
 
 Read [Agent Releases](docs/agent-releases.md), [Maintenance Service](docs/maintenance-socket.md), [Configuration Backups](docs/configuration-backups.md) and [Security](docs/security.md) before rollout. Apply the separate v1.9.2 authentication hotfix only after verifying existing host credentials. Never retain an authentication bypass to keep an old enrollment online.
-
-VMange is a free and open-source infrastructure management dashboard for Linux hosts, VirtualBox, Docker, Docker Compose, scripts, terminal workflows, monitoring, and alarms.
-
-It is designed around outbound host agents, so it can work from shared hosting, a WordPress subfolder, a public subfolder, a subdomain, a standalone PHP host, a Docker deployment, or a private local VM without requiring VMange to SSH directly into managed hosts.
 
 ## Reusing This Project
 
